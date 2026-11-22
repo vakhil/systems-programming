@@ -321,24 +321,261 @@ if __name__ == '__main__':
       }
     ],
     theory: {
-      highLevelArchitecture: 'Redis avoids multi-threaded locks by running all command executions sequentially on a single thread. Because all data is in RAM and operations take nanoseconds, it can process 100,000+ operations per second effortlessly.',
-      mentalModel: 'A fast receptionist with a giant physical rolodex. They only talk to one person at a time, but because they can flip to any card in 1 millisecond, the line never stalls.',
+      highLevelArchitecture: 'Redis achieves ultra-high throughput (exceeding 150,000 requests per second per core) by combining an in-memory data store with a single-threaded event loop based on the Reactor Pattern. While multi-threaded systems burn CPU cycles on mutex locks, thread context switches, and cache line invalidation, Redis processes all commands sequentially on a single thread. Because RAM operations complete in single-digit nanoseconds, single-threaded execution eliminates all locking overhead while ensuring deterministic serialization. The server parses the human-readable, binary-safe REdis Serialization Protocol (RESP), stores keys in a hash table with incremental rehashing, and evicts expired keys via passive and active sampling.',
+      mentalModel: 'Imagine a high-speed barista at an espresso bar who operates alone. Instead of having five baristas bumping elbows, dropping cups, and waiting in line for the single coffee grinder (mutex lock contention), the single master barista takes an order, pulls an espresso shot in 10 nanoseconds, hands it to the customer, and immediately serves the next person. Because the barista never waits for anything, the line moves faster than a team of ten conflicted workers.',
+      deepDiveConcepts: [
+        {
+          title: 'The Single-Threaded Reactor Event Loop (aeEventLoop)',
+          tag: 'Concurrency & CPU Architecture',
+          coreConcept: 'Redis is single-threaded for command execution. By avoiding POSIX mutex locks and thread synchronizations, CPU L1/L2 caches remain ultra-hot and throughput skyrockets.',
+          inDepthExplanation: `In multi-threaded databases, scaling to multiple threads introduces Amdahl's Law bottlenecks:
+1. Mutex Contention: If 16 threads attempt to modify a shared in-memory hash table, threads spend up to 70% of their time blocked on pthread_mutex_lock() or spinlocks.
+2. Cache Invalidation: When Thread A on CPU Core 1 writes to a memory address, the MESI cache coherence protocol must invalidate that cache line across Cores 2 through 16, forcing slow DRAM memory bus reloads.
+3. Deadlocks & Race Conditions: Complex transactions require multi-lock hierarchies that risk deadlocks.
+
+Redis sidesteps this entirely by running command execution on a single thread (using epoll on Linux, kqueue on macOS, or select). When a network packet arrives, the event loop deserializes the RESP command, modifies the in-memory dictionary in single-digit nanoseconds, and queues the response. Because operations are non-blocking and in RAM, the single thread easily processes 100,000+ operations per second.`,
+          asciiDiagram: `
+MULTI-THREADED (BLOCKED ON LOCKS):
+Thread 1 (Core 1) ---+
+Thread 2 (Core 2) ----> [ Shared Mutex Lock ] ---> Cache Invalidations & Context Switches
+Thread 3 (Core 3) ---+
+
+REDIS SINGLE-THREADED REACTOR:
+Socket Events ===> [ epoll_wait() ] ===> [ Single Event Loop ] ===> [ RAM Hash Table ]
+                                        (Zero Locks, 100% CPU Cache Hit Rate!)`
+        },
+        {
+          title: 'The REdis Serialization Protocol (RESP v2/v3)',
+          tag: 'Protocol Specifications',
+          coreConcept: 'RESP is human-readable, simple to parse, and binary-safe because byte lengths are transmitted before data payloads.',
+          inDepthExplanation: `Redis communicates using RESP. Every packet starts with a 1-byte type prefix, followed by fields delimited by \\r\\n (CRLF):
+
+1. Simple Strings (+): Starts with '+', used for status messages. Example: "+OK\\r\\n".
+2. Errors (-): Starts with '-', used for server errors. Example: "-ERR unknown command\\r\\n".
+3. Integers (:): Starts with ':', followed by a signed 64-bit integer. Example: ":1000\\r\\n".
+4. Bulk Strings ($): Binary-safe strings. Starts with '$', followed by length in decimal, \\r\\n, the raw bytes, and \\r\\n. Null bulk string is represented as "$-1\\r\\n". Example: "$5\\r\\nhello\\r\\n".
+5. Arrays (*): Starts with '*', followed by number of elements. Each element is another RESP type.
+
+Every command sent by redis-cli is encoded as an Array of Bulk Strings!
+For example, the command SET mykey "hello world" is transmitted on the wire as:
+*3\\r\\n$3\\r\\nSET\\r\\n$5\\r\\nmykey\\r\\n$11\\r\\nhello world\\r\\n`,
+          asciiDiagram: `
+RESP WIRE SERIALIZATION (SET foo bar):
+Byte Stream:  *3 \\r\\n  $3 \\r\\n SET \\r\\n  $3 \\r\\n foo \\r\\n  $3 \\r\\n bar \\r\\n
+Meaning:      Array(3)   BulkStr(3)="SET"  BulkStr(3)="foo"  BulkStr(3)="bar"`
+        },
+        {
+          title: 'Incremental Hash Table Rehashing (dictRehash)',
+          tag: 'Algorithms & Data Structures',
+          coreConcept: 'To prevent latency spikes when resizing a dictionary holding millions of keys, Redis resizes incrementally across subsequent queries.',
+          inDepthExplanation: `In naive hash tables, when the load factor exceeds 1.0 (number of elements > table size), the table doubles its capacity. A naive implementation allocates a new table of size 2*N and rehashes all N keys in a single giant loop. If a Redis instance holds 20 million keys, a stop-the-world rehash would freeze the server for 500+ milliseconds, violating real-time SLA guarantees!
+
+Redis Incremental Rehashing (dict.c):
+1. Every dictionary holds TWO hash tables: ht[0] (current active table) and ht[1] (new table during resizing).
+2. When resizing begins, ht[1] is allocated at 2x size, and a global rehashidx is set to 0.
+3. Every time a client executes ANY command (GET, SET, DEL), Redis performs 1 step of incremental rehashing: it moves all entries from bucket ht[0][rehashidx] into ht[1], and increments rehashidx by 1.
+4. Active reads check ht[0] first; if not found, they check ht[1]. All new writes go directly to ht[1].
+5. Once rehashidx reaches the end of ht[0], ht[1] becomes ht[0], ht[1] is cleared, and rehashidx resets to -1.
+The cost of resizing is spread across thousands of operations, keeping max latency under 1 millisecond!`,
+          asciiDiagram: `
+INCREMENTAL REHASHING (ht[0] -> ht[1]):
+rehashidx = 2:
+ht[0] (Old Size = 4):                ht[1] (New Size = 8):
+Bucket 0: [ NULL ] (Migrated!)  ---> Bucket 0: [ Entry A ]
+Bucket 1: [ NULL ] (Migrated!)  ---> Bucket 1: [ Entry B ]
+Bucket 2: [ Entry C ] <--- CURRENT   Bucket 2: [ ... ]
+Bucket 3: [ Entry D ]                ...`
+        },
+        {
+          title: 'Key TTL Expiration: Passive Eviction & Active Sampling',
+          tag: 'Memory Reclamation & Garbage Collection',
+          coreConcept: 'Redis combines lazy passive eviction upon key lookup with periodic probabilistic active sampling to reclaim memory without CPU thrashing.',
+          inDepthExplanation: `When a key is set with an expiration (e.g. EXPIRE session 300), Redis must ensure memory is reclaimed when the TTL lapses. Checking every key in the database continuously would peg CPU utilization at 100%.
+
+Redis employs a two-tiered eviction strategy:
+1. Passive Eviction (Lazy): Whenever a client executes GET, EXISTS, or DEL on a key, Redis inspects the key's TTL in its expires dictionary. If the current epoch timestamp exceeds the expiration timestamp, Redis deletes the key immediately and returns nil (Key Not Found).
+2. Active Eviction (Probabilistic Background Sampling): What happens to keys that are never read again? Without active eviction, they would leak memory forever.
+Every 100ms, the event loop runs activeExpireCycle():
+  a. Randomly sample 20 keys with an associated TTL.
+  b. Delete all expired keys among the 20.
+  c. If more than 25% (5 keys) were expired, repeat step (a) immediately!
+This probabilistic algorithm ensures that less than 10% of expired keys linger in RAM at any given moment, with minimal CPU overhead.`,
+          codeSnippet: `// Passive key eviction check on read
+robj* lookup_key_or_expire(dict* db, dict* expires, const char* key) {
+    uint64_t* expire_time = dict_get(expires, key);
+    if (expire_time && current_time_ms() > *expire_time) {
+        dict_delete(db, key);
+        dict_delete(expires, key);
+        return NULL; // Key expired!
+    }
+    return dict_get(db, key);
+}`
+        }
+      ],
+      executionRoadmap: [
+        {
+          phaseNumber: 1,
+          phaseTitle: 'TCP Socket Listener & Streaming RESP Parser',
+          summary: 'Bind to port 6379, accept TCP connections, and implement a byte-by-byte streaming RESP tokenizer decoding Arrays and Bulk Strings.',
+          architectureDeepDive: 'In this phase, we establish protocol compatibility. We listen on port 6379 (the official Redis port). When redis-cli connects, it sends commands formatted as RESP arrays. We implement a parser that reads the leading prefix (*, $, +, -, :), extracts lengths, and parses string payloads.',
+          visualWorkflowAscii: `
+RESP Parsing Stream:
+Socket Read -> Inspect byte 0
+                 |
+        +--------+--------+--------+
+        | '*'             | '$'    | '+'
+        v                 v        v
+   Parse Array       Bulk String  Simple String
+   Read length N     Read size N  Read until \\r\\n`,
+          concreteExecutionSteps: [
+            'Create redis_server.py (or redis_server.c) and bind socket to 0.0.0.0:6379.',
+            'Implement parse_resp(reader): check prefix byte (*, $, :, +, -).',
+            'For b\'*\': read integer count N, recurse to read N array elements.',
+            'For b\'$\': read integer length L, read exactly L bytes + 2 bytes (\\r\\n).',
+            'Handle PING: return "+PONG\\r\\n".',
+            'Test with official redis-cli -p 6379 PING.'
+          ],
+          verificationCommand: 'python3 redis_server.py & sleep 1 && redis-cli -p 6379 PING && killall python3',
+          expectedOutput: `[SERVER] Redis clone listening on port 6379
+[CLIENT] Received: ['PING']
+[RESP] Sent: +PONG
+PONG
+[PASS] Phase 1 TCP listener and RESP protocol parser verified with official redis-cli!`,
+          edgeCasesAndPitfalls: [
+            'Slicing \\r\\n: remember that Bulk Strings are followed by \\r\\n; if you do not consume those 2 delimiter bytes, subsequent command parsing will desync.',
+            'Empty bulk strings ($0\\r\\n\\r\\n) vs Null bulk strings ($-1\\r\\n).'
+          ]
+        },
+        {
+          phaseNumber: 2,
+          phaseTitle: 'In-Memory Key-Value Dictionary & Core Commands',
+          summary: 'Build the in-memory hash dictionary supporting SET, GET, DEL, EXISTS, and MGET with correct RESP return types.',
+          architectureDeepDive: 'We implement the primary data store: a dictionary mapping string keys to string or binary values. We implement SET key val, returning +OK\\r\\n. For GET key, if found, return $len\\r\\nval\\r\\n; if missing, return the null bulk string $-1\\r\\n. For DEL key, return integer count :1\\r\\n or :0\\r\\n.',
+          visualWorkflowAscii: `
+Command Execution Pipeline:
+Client sends: SET name "Alice"
+  |
+  v Tokenized: ['SET', 'name', 'Alice']
+  v
+In-Memory Hash Table: store db["name"] = "Alice"
+  |
+  v Response: "+OK\\r\\n"
+Client sends: GET name
+  |
+  v Response: "$5\\r\\nAlice\\r\\n"`,
+          concreteExecutionSteps: [
+            'Initialize global dictionary db = {}.',
+            'Route command dispatch: match cmd.upper().',
+            'Implement cmd_set(key, value): store in db, reply b"+OK\\r\\n".',
+            'Implement cmd_get(key): if key in db reply b"${len(val)}\\r\\n" + val + b"\\r\\n", else reply b"$-1\\r\\n".',
+            'Implement cmd_del(keys): count deleted keys, reply b":{count}\\r\\n".',
+            'Implement cmd_exists(keys): reply b":{count}\\r\\n".',
+            'Verify with sequential redis-cli commands.'
+          ],
+          verificationCommand: 'python3 redis_server.py & sleep 1 && redis-cli -p 6379 SET user "antigravity" && redis-cli -p 6379 GET user && redis-cli -p 6379 DEL user && redis-cli -p 6379 GET user && killall python3',
+          expectedOutput: `OK
+"antigravity"
+(integer) 1
+(nil)
+[PASS] Phase 2 Core in-memory dictionary operations verified!`,
+          edgeCasesAndPitfalls: [
+            'Case insensitivity for commands: redis-cli sends "set", "Set", or "SET"; always normalize command names with upper().',
+            'Binary keys: keys in Redis can contain arbitrary bytes (even null bytes); never treat keys as null-terminated strings.'
+          ]
+        },
+        {
+          phaseNumber: 3,
+          phaseTitle: 'TTL Key Expirations & Passive/Active Eviction',
+          summary: 'Implement EXPIRE, TTL, and SET ... EX commands, with lazy passive checks on read and active background timer eviction.',
+          architectureDeepDive: 'We track key lifetimes using an expires dictionary storing key -> unix_timestamp_ms. We update cmd_get to check if the current time exceeds the expiration timestamp (passive eviction). Additionally, we implement a periodic timer thread that randomly inspects 20 keys and evicts expired keys (active eviction).',
+          visualWorkflowAscii: `
+TTL Expiration Flow:
+SET temp_key "data" EX 2 -> expires["temp_key"] = now() + 2000ms
+  |
+  +-- Read at t = 1s: now() < expire_time -> Return "$4\\r\\ndata\\r\\n"
+  |
+  +-- Read at t = 3s: now() > expire_time -> Delete from db & expires -> Return "$-1\\r\\n" (nil)`,
+          concreteExecutionSteps: [
+            'Create secondary dictionary expires = {}.',
+            'Support SET key val EX seconds syntax.',
+            'Implement cmd_expire(key, seconds): calculate timestamp_ms, store in expires, reply :1.',
+            'Implement cmd_ttl(key): return remaining seconds as integer, -1 if no TTL, -2 if key missing.',
+            'In lookup_key(key): if expired, delete and return None.',
+            'Spawn active_expire_loop(): every 100ms, sample keys and purge expired entries.'
+          ],
+          verificationCommand: 'python3 redis_server.py & sleep 1 && redis-cli -p 6379 SET test_ttl "fast" EX 1 && redis-cli -p 6379 TTL test_ttl && sleep 2 && redis-cli -p 6379 GET test_ttl && killall python3',
+          expectedOutput: `OK
+(integer) 1
+(nil)
+[PASS] Phase 3 TTL key expiration and automated eviction verified!`,
+          edgeCasesAndPitfalls: [
+            'Setting a key removes existing TTL: if key already had a TTL and SET is called without EX, you must delete the old TTL from expires.',
+            'Clock skew: use monotonic clock (time.monotonic() or clock_gettime(CLOCK_MONOTONIC)) to avoid leap second bugs.'
+          ]
+        },
+        {
+          phaseNumber: 4,
+          phaseTitle: 'redis-benchmark Stress Testing & Concurrent Pipelining',
+          summary: 'Optimize connection handling with non-blocking multiplexing, support command pipelining, and benchmark with official redis-benchmark.',
+          architectureDeepDive: 'In this production phase, we run redis-benchmark. Redis clients use pipelining: sending 100 commands back-to-back without waiting for individual responses. We ensure our server can read multiple commands from a single socket buffer and stream responses consecutively without stalling.',
+          visualWorkflowAscii: `
+Command Pipelining Stream:
+Client sends 3 commands in 1 TCP packet: [ SET a 1 ][ SET b 2 ][ GET a ]
+                                                  |
+                                                  v Server processes sequentially
+Client receives 3 responses in 1 TCP packet:  [ +OK ][ +OK ][ $1\\r\\n1\\r\\n ]`,
+          concreteExecutionSteps: [
+            'Ensure receive buffer processes all complete commands in a single buffer before returning.',
+            'Implement support for INCR and DECR atomic counter commands.',
+            'Run official redis-benchmark with 50 concurrent clients.',
+            'Verify throughput exceeds 50,000+ requests per second.'
+          ],
+          verificationCommand: 'python3 redis_server.py & sleep 1 && redis-benchmark -p 6379 -t set,get -n 10000 -q && killall python3',
+          expectedOutput: `SET: 78125.00 requests per second, p50=0.512 msec
+GET: 82644.62 requests per second, p50=0.488 msec
+[PASS] Phase 4 High-throughput production benchmark verified against official Redis test suite!`,
+          edgeCasesAndPitfalls: [
+            'Closing connection on partial reads: if buffer contains half a command, do NOT close the connection; wait for the remainder.',
+            'Outbound buffer bloat: in C, use non-blocking write queues with EPOLLOUT for high pipelined volume.'
+          ]
+        }
+      ],
       dataStructures: [
         {
           name: 'RESP Array Frame Layout',
-          description: 'Standard encoding for a command like `SET foo bar`.',
+          description: 'Standard protocol encoding for a command like `SET foo bar` transmitted as an array of bulk strings.',
           asciiDiagram: `
-*3\\r\\n        --> Array with 3 elements
-$3\\r\\nSET\\r\\n  --> Bulk string "SET"
-$3\\r\\nfoo\\r\\n  --> Bulk string "foo"
-$3\\r\\nbar\\r\\n  --> Bulk string "bar"`
++-------------------------------------------------------------------+
+| *3\\r\\n        --> Array header with 3 elements                     |
+| $3\\r\\nSET\\r\\n  --> Element 0: Bulk string "SET"                   |
+| $3\\r\\nfoo\\r\\n  --> Element 1: Bulk string "foo"                   |
+| $3\\r\\nbar\\r\\n  --> Element 2: Bulk string "bar"                   |
++-------------------------------------------------------------------+`
+        },
+        {
+          name: 'Dual-Table Incremental Rehashing Dict (dictEntry)',
+          description: 'Memory layout of Redis hash tables ht[0] and ht[1] with rehashidx tracking incremental migration progress.',
+          asciiDiagram: `
++-------------------------------------------------------------------+
+| dict                                                              |
+|   dictType *type;                                                 |
+|   dictht ht[2];       // Two hash tables: ht[0] (active), ht[1]   |
+|   long rehashidx;     // -1 if not rehashing; index if active     |
+|   int iterators;                                                  |
++-------------------------------------------------------------------+`
         }
       ],
       keySyscalls: [
-        { syscall: 'socket', signature: 'int socket(AF_INET, SOCK_STREAM, 0);', purpose: 'Listens on port 6379.' },
-        { syscall: 'gettimeofday', signature: 'int gettimeofday(struct timeval *tv, struct timezone *tz);', purpose: 'Accurate TTL time comparisons.' }
+        { syscall: 'socket', signature: 'int socket(AF_INET, SOCK_STREAM, 0);', purpose: 'Creates TCP listener on port 6379.' },
+        { syscall: 'epoll_wait', signature: 'int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);', purpose: 'Multiplexes thousands of active redis-cli connections on a single thread.' },
+        { syscall: 'clock_gettime', signature: 'int clock_gettime(clockid_t clk_id, struct timespec *tp);', purpose: 'Fetches high-resolution millisecond timestamps for TTL expiration checks.' }
       ],
-      commonPitfalls: ['Blocking on slow clients: Always write non-blocking response buffers.'],
+      commonPitfalls: [
+        'Blocking on slow clients: Performing blocking send() will stall all other 10,000 clients in the single-threaded event loop.',
+        'Desynchronizing \\r\\n delimiters: Forgetting that bulk strings end with \\r\\n corrupts subsequent command parsing.',
+        'Memory leaks from unqueried TTL keys: Without active background sampling, unread keys with TTL will linger in RAM indefinitely.',
+        'Not handling pipelined requests: Assuming one socket read contains only one command causes pipelined benchmarks to fail.'
+      ],
       visualizerType: 'redis'
     },
     hints: {
@@ -692,23 +929,293 @@ if __name__ == '__main__':
       }
     ],
     theory: {
-      highLevelArchitecture: 'A torrent file divides a large file into fixed-size pieces (e.g. 512KB). Each piece has a known SHA-1 hash listed in the torrent metainfo. A client connects to multiple peers simultaneously, asks each peer which pieces they possess (via bitfield), and downloads different pieces concurrently.',
-      mentalModel: 'A puzzle where 100 people in a room each hold different puzzle pieces. You walk around trading and collecting pieces from whoever has the ones you are missing.',
+      highLevelArchitecture: 'BitTorrent revolutionizes content distribution by turning downloaders into uploaders, transforming bandwidth consumption from a centralized O(N) server bottleneck into a decentralized swarm where network capacity scales with participant count. A .torrent metainfo file divides target files into equal fixed-size chunks called pieces (typically 256KB to 2MB), cataloged by an array of 20-byte SHA-1 hashes. A client parses the Bencoded metainfo, announces itself to a central tracker to discover active peers, establishes TCP connections using a 68-byte handshake, synchronizes piece availability using bitfields, requests 16KB sub-blocks via an asynchronous pipeline, and verifies each assembled piece against its cryptographic SHA-1 digest before writing to disk.',
+      mentalModel: 'Imagine a 1,000-page historical encyclopedia. A centralized server is a single photocopier with a line of 1,000 students; the photocopier overheats and the line takes weeks. In BitTorrent, the professor gives Page 1 to Student A, Page 2 to Student B, and Page 3 to Student C. Students then photocopy and trade pages directly with each other. Within minutes, every student has assembled the entire 1,000-page encyclopedia without the professor ever touching another piece of paper.',
+      deepDiveConcepts: [
+        {
+          title: 'Bencode Grammar & The Critical Info-Hash Gotcha',
+          tag: 'Data Serialization & Cryptography',
+          coreConcept: 'Bencode is a minimal binary serialization format. The 20-byte info_hash MUST be computed over the raw original slice of the torrent file, not a re-encoded dictionary.',
+          inDepthExplanation: `BitTorrent uses Bencode (RFC BEP 0003) for all metadata and tracker communication. Bencode supports four data types:
+1. Integers: 'i' + ASCII number + 'e'. Example: i42e represents 42.
+2. Byte Strings: Length in ASCII + ':' + raw bytes. Example: 4:spam represents "spam".
+3. Lists: 'l' + items + 'e'. Example: l4:spami42ee represents ["spam", 42].
+4. Dictionaries: 'd' + alternating key-value pairs (keys must be sorted strings) + 'e'.
+
+The #1 Trap in BitTorrent Client Implementation:
+The torrent's unique identity is the info_hash—the 20-byte SHA-1 digest of the bencoded "info" dictionary:
+info_hash = SHA1(raw_bencoded_bytes_of_info_dict)
+
+If you parse the torrent into a standard language dictionary (e.g. Python dict or Go map) and then re-encode it back to Bencode to compute the SHA-1, slight differences in dictionary key ordering, whitespace, or integer representations will produce an invalid info_hash! The tracker and peers will reject your connection. You must preserve the exact raw slice of bytes from the original file representing the info dictionary!`,
+          asciiDiagram: `
+BENCODE RECURSIVE DESCENT GRAMMAR:
+'i' 12345 'e'                      ===> Integer: 12345
+'4' ':' 'w' 'i' 'k' 'i'             ===> Byte String: "wiki"
+'l' 4:wiki i42e 'e'                 ===> List: ["wiki", 42]
+'d' 4:name 4:test 'e'               ===> Dictionary: {"name": "test"}
+
+RAW FILE EXTRACTION FOR INFO_HASH:
+[ ... 'd' ... 4:info ( RAW SLICE: d6:lengthi1024e4:name...e ) ... 'e' ]
+                       |
+                       +---> SHA1(raw_slice) ===> 20-Byte info_hash!`
+        },
+        {
+          title: 'Tracker Protocol & Compact 6-Byte Binary Peer Lists',
+          tag: 'Networking Protocols',
+          coreConcept: 'Trackers return peer swarms not as JSON or text, but as dense 6-byte binary chunks: 4 bytes of IPv4 address and 2 bytes of Big-Endian port.',
+          inDepthExplanation: `To discover who holds pieces of the file, the client sends an HTTP GET request to the tracker announce URL:
+GET /announce?info_hash=%12%34...&peer_id=-AG0001-...&port=6881&uploaded=0&downloaded=0&left=1048576&compact=1
+
+Key Parameters:
+- info_hash: The 20-byte SHA-1 digest, URL-percent-encoded.
+- peer_id: A 20-byte string randomly generated by your client to identify itself.
+- left: Remaining bytes to download.
+- compact=1: Requests the compact binary peer representation (RFC BEP 0023).
+
+The tracker returns a Bencoded response containing a dictionary. In compact mode, the peers key contains a single continuous byte string. Every 6 bytes represents one peer:
+- Bytes 0-3: IPv4 address (e.g. 192.168.1.50 -> 0xC0, 0xA8, 0x01, 0x32).
+- Bytes 4-5: TCP Port in Network Byte Order (e.g. 6881 -> 0x1A, 0xE1).
+
+Parsing 50 peers requires simply looping through the string in 6-byte increments with socket.inet_ntoa() and struct.unpack("!H")!`,
+          asciiDiagram: `
+COMPACT 6-BYTE BINARY PEER ENCODING:
+Byte Offset:   0      1      2      3       4      5
+Field:       [ IP_0 | IP_1 | IP_2 | IP_3 ] [ PORT_HI | PORT_LO ]
+Example:     [ 192  | 168  | 1    | 50  ] [  0x1A   |  0xE1   ]
+Result:      IP: "192.168.1.50", Port: 6881`
+        },
+        {
+          title: 'The 68-Byte Peer Wire Handshake & Binary Framing',
+          tag: 'P2P Wire Protocols',
+          coreConcept: 'All peer communication begins with a fixed 68-byte binary handshake verifying mutual interest in the same info_hash.',
+          inDepthExplanation: `Once you connect to a peer's IP:Port via TCP, you must execute the 68-byte handshake before sending any protocol messages:
+1. Protocol String Length (1 Byte): Always 0x13 (decimal 19).
+2. Protocol String (19 Bytes): ASCII string "BitTorrent protocol".
+3. Extension Reserved Bytes (8 Bytes): Set to 0x00 (used for DHT and extension protocols).
+4. Info Hash (20 Bytes): The 20-byte SHA-1 digest of the torrent info dictionary.
+5. Peer ID (20 Bytes): Your client's 20-byte ID.
+
+The peer immediately responds with its own 68-byte handshake. Your client MUST inspect bytes 28-47 of the peer's response: if the peer's info_hash does not match your expected info_hash, close the TCP connection immediately!
+
+Subsequent Peer Messages (Binary Framing):
+Every message following the handshake has the format:
+[ 4-byte Message Length (Big-Endian) ] + [ 1-byte Message ID ] + [ Optional Payload ]
+- ID 0: Choke | ID 1: Unchoke | ID 2: Interested | ID 3: Not Interested
+- ID 4: Have (4B piece index) | ID 5: Bitfield | ID 6: Request | ID 7: Piece`,
+          asciiDiagram: `
+68-BYTE HANDSHAKE LAYOUT:
++------+-----------------------+------------------+--------------------+--------------------+
+| 1B   | 19 Bytes              | 8 Bytes          | 20 Bytes           | 20 Bytes           |
+| 0x13 | "BitTorrent protocol" | Reserved (0x00)  | 20-Byte info_hash  | 20-Byte peer_id    |
++------+-----------------------+------------------+--------------------+--------------------+`
+        },
+        {
+          title: 'Peer Choking State Machine & Block Pipelining',
+          tag: 'Distributed Flow Control',
+          coreConcept: 'Peers start in a choked state. Clients cannot request blocks until unchoked. Pipelining multiple 16KB block requests saturates network bandwidth.',
+          inDepthExplanation: `BitTorrent uses a 4-state orthogonal state machine between any two peers:
+- am_choking: Are we refusing to send data to the peer? (Starts 1)
+- am_interested: Are we interested in pieces the peer holds? (Starts 0)
+- peer_choking: Is the peer refusing to send data to us? (Starts 1)
+- peer_interested: Is the peer interested in our pieces? (Starts 0)
+
+Download Workflow:
+1. When a peer sends a bitfield (ID 5) indicating it has pieces we need, we send Message ID 2 (interested).
+2. We wait until the peer sends Message ID 1 (unchoke). Now peer_choking is 0!
+3. Block Pipelining: A piece (e.g. 512KB) is too large to request in one message. We slice each piece into 16KB (16,384 bytes) blocks.
+If we send one request, wait for the response, and send the next, high network latency (RTT 150ms) will throttle download speeds to 100KB/s.
+Instead, we maintain an in-flight pipeline of 5 block requests simultaneously! As each block arrives, we immediately dispatch the next request, keeping the TCP pipe fully saturated.`,
+          asciiDiagram: `
+BLOCK PIPELINING ACROSS A 512KB PIECE:
+Piece Index 0 (512KB) = 32 Sub-blocks of 16KB each
+In-Flight Window = 5 Requests:
+[ Block 0 (Req) ] [ Block 1 (Req) ] [ Block 2 (Req) ] [ Block 3 (Req) ] [ Block 4 (Req) ]
+        |
+        v Block 0 arrives!
+Store Block 0 ---> Immediately dispatch [ Block 5 (Req) ]! Zero pipe stalling!`
+        }
+      ],
+      executionRoadmap: [
+        {
+          phaseNumber: 1,
+          phaseTitle: 'Bencode Recursive Parser & Info-Hash Calculation',
+          summary: 'Build a recursive descent Bencode parser in pure code, decode sample torrent files, and calculate the exact 20-byte SHA-1 info_hash.',
+          architectureDeepDive: 'In this phase, we master Bencode serialization. We construct a parser handling integers (i42e), byte strings (4:wiki), lists (l...e), and dictionaries (d...e). We extract the exact raw slice of bytes corresponding to the "info" dictionary and calculate its SHA-1 hash.',
+          visualWorkflowAscii: `
+Torrent File Parsing:
+.torrent File Bytes -> Recursive Descent Parser
+                             |
+         +-------------------+-------------------+
+         |                                       |
+    Tracker URL                             Piece Length, File Names,
+    ("http://tracker...")                   and raw info dictionary
+                                                 |
+                                            SHA1(info_slice)
+                                                 v
+                                        20-byte info_hash`,
+          concreteExecutionSteps: [
+            'Create bencode.py with decode_bencode(bytes, index) returning (obj, new_index).',
+            'Handle \'i\' for integers, digits for length-prefixed strings, \'l\' for lists, \'d\' for dicts.',
+            'Track start and end byte offsets of the "info" dictionary key during parsing.',
+            'Slice the exact raw bytes: raw_info = file_bytes[info_start:info_end].',
+            'Compute hashlib.sha1(raw_info).hexdigest() and verify against known torrent info hash.'
+          ],
+          verificationCommand: 'python3 -c "import bencode; print(\'Bencode test:\', bencode.decode_bencode(b\'d4:wiki5:robot3:numi42ee\'))"',
+          expectedOutput: `[BENCODE] Decoded dictionary: {'wiki': b'robot', 'num': 42}
+[INFO_HASH] Calculated SHA-1: c42a8b9f1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a
+[PASS] Phase 1 Bencode recursive descent parser and raw info_hash calculation verified!`,
+          edgeCasesAndPitfalls: [
+            'Dictionary keys in Bencode MUST be sorted in lexicographical order: re-ordering keys breaks hash calculations.',
+            'Negative integers: handle i-42e correctly.'
+          ]
+        },
+        {
+          phaseNumber: 2,
+          phaseTitle: 'Tracker Announce & Compact Peer Swarm Discovery',
+          summary: 'Send an HTTP GET request to the tracker announce URL with urlencoded info_hash, decode compact peer lists, and extract IP:Port sockets.',
+          architectureDeepDive: 'We communicate with the BitTorrent tracker. We construct the query parameters with our 20-byte info_hash, our generated peer_id, port 6881, and compact=1. We decode the tracker response and unpack the 6-byte binary peer blocks.',
+          visualWorkflowAscii: `
+Tracker Discovery Flow:
+Client ---> HTTP GET /announce?info_hash=...&compact=1 ---> Tracker Server
+                                                                   |
+Client <--- Bencoded Response: { "peers": <binary_string> } <------+
+  |
+  v Unpack 6-byte chunks (4B IP + 2B Port)
+Peer Swarm: [ ("192.168.1.10", 6881), ("10.0.0.4", 51413), ... ]`,
+          concreteExecutionSteps: [
+            'Generate random 20-byte peer_id starting with "-AG0001-" + 12 random bytes.',
+            'Build announce URL with urllib.parse.urlencode handling raw bytes info_hash.',
+            'Send HTTP GET request using urllib.request or raw sockets.',
+            'Bencode decode tracker response dictionary.',
+            'Extract "peers" byte string and iterate in 6-byte steps: IP = socket.inet_ntoa(chunk[:4]), Port = struct.unpack("!H", chunk[4:6])[0].',
+            'Print list of active peer IP:Port endpoints.'
+          ],
+          verificationCommand: 'python3 tracker.py sample.torrent',
+          expectedOutput: `[TRACKER] Contacting http://torrent.ubuntu.com:6969/announce...
+[TRACKER] Announce successful! Interval: 1800s, Complete (seeders): 1420, Incomplete (leechers): 85
+[SWARM] Discovered 50 peers in compact binary response:
+  -> Peer 1: 185.125.190.59:6881
+  -> Peer 2: 91.189.95.83:51413
+  -> Peer 3: 194.150.168.164:6881
+[PASS] Phase 2 Tracker communication and compact peer discovery verified!`,
+          edgeCasesAndPitfalls: [
+            'URL encoding binary hashes: do not use standard string quote; must encode raw 20 bytes (%XX format).',
+            'Tracker returning non-compact dictionary peers: fall back to parsing list of dicts with "ip" and "port" keys.'
+          ]
+        },
+        {
+          phaseNumber: 3,
+          phaseTitle: '68-Byte Peer Handshake & Bitfield Synchronization',
+          summary: 'Connect to an active peer via TCP, send the 68-byte BitTorrent handshake, verify the returned info_hash, and parse the peer bitfield.',
+          architectureDeepDive: 'We open a TCP socket to a peer. We send the 68-byte handshake: chr(19) + "BitTorrent protocol" + 8 zeros + info_hash + peer_id. We read 68 bytes back from the socket and assert that the returned info_hash matches ours. Then we read framed messages until we receive Message ID 5 (bitfield), recording which pieces the peer possesses.',
+          visualWorkflowAscii: `
+Peer Handshake Exchange:
+Client                                           Peer (185.125.190.59)
+  |                                                        |
+  | -------- 68-Byte Handshake (info_hash) --------------> |
+  | <------- 68-Byte Handshake (Verify info_hash!) ------- |
+  |                                                        |
+  | <------- Message ID 5: Bitfield (Pieces Available) --- |
+  | -------- Message ID 2: Interested -------------------> |
+  | <------- Message ID 1: Unchoke (Ready for download!) - |`,
+          concreteExecutionSteps: [
+            'Create peer.py with PeerConnection class.',
+            'Open socket: sock.connect((peer_ip, peer_port)). Set 10-second timeout.',
+            'Send handshake: b"\\x13BitTorrent protocol\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00" + info_hash + peer_id.',
+            'Read 68 bytes from peer; assert peer_response[28:48] == info_hash.',
+            'Implement message reader: read 4-byte length prefix N, then read N bytes.',
+            'If message ID is 5 (bitfield): parse byte array into boolean array has_piece[piece_idx].',
+            'Send Message ID 2 (interested): struct.pack("!IB", 1, 2).'
+          ],
+          verificationCommand: 'python3 peer_handshake.py sample.torrent',
+          expectedOutput: `[PEER] Connecting to 185.125.190.59:6881... Connected!
+[HANDSHAKE] Sent 68-byte handshake with info_hash: c42a8b9f...
+[HANDSHAKE] Received valid 68-byte peer handshake (Protocol: 'BitTorrent protocol')
+[RECV] Message ID 5 (Bitfield): Peer holds 512 / 512 pieces (100% complete seeder)
+[SEND] Message ID 2 (Interested) dispatched to peer.
+[RECV] Message ID 1 (Unchoke) received! Peer is ready for block requests.
+[PASS] Phase 3 TCP peer wire handshake and bitfield state machine verified!`,
+          edgeCasesAndPitfalls: [
+            'Peer timeout: many public peers are offline or behind NAT firewalls; always use non-blocking connects or short socket timeouts.',
+            'Mismatched info_hash: immediately drop the connection if the peer is serving a different torrent.'
+          ]
+        },
+        {
+          phaseNumber: 4,
+          phaseTitle: 'Block Pipelining, SHA-1 Piece Verification & File Assembly',
+          summary: 'Download 16KB sub-blocks via an asynchronous pipeline, assemble complete pieces, verify against 20-byte SHA-1 digests, and write to disk with pwrite().',
+          architectureDeepDive: 'In this culminating phase, we download real data. We select missing pieces using Rarest-First. We divide each piece into 16,384-byte blocks and pipeline 5 block requests simultaneously (Message ID 6: request). When all blocks for a piece arrive, we concatenate them, compute SHA-1, assert equality with the torrent metainfo hash, and write directly to disk at offset = piece_idx * piece_len.',
+          visualWorkflowAscii: `
+Piece Assembly & Disk Write:
+Block 0 (16KB) + Block 1 (16KB) + ... + Block 31 (16KB) = 512KB Buffer
+                                |
+                                v
+                       Compute SHA1(Buffer)
+                                |
+             +------------------+------------------+
+             | Matches Metainfo                    | Mismatch! (Corrupted)
+             v                                     v
+       pwrite(disk_fd, offset)               Discard Buffer!
+       Mark Bitfield = 1                     Re-request from other peer!`,
+          concreteExecutionSteps: [
+            'Create target output file on disk with open(filepath, "wb") and seek/write to allocate full size.',
+            'For piece index P: calculate num_blocks = ceil(piece_length / 16384).',
+            'Send 5 pipelined block requests: struct.pack("!IBIII", 13, 6, P, block_offset, 16384).',
+            'On Message ID 7 (piece): unpack piece_index, begin_offset, and data block.',
+            'When all blocks for piece P arrive: assert hashlib.sha1(piece_buffer).digest() == expected_hashes[P].',
+            'Write verified piece to disk: file.seek(P * piece_length); file.write(piece_buffer).',
+            'Verify complete file integrity with sha256sum.'
+          ],
+          verificationCommand: 'python3 download_piece.py sample.torrent 0 && ls -lh downloaded_piece_0.bin',
+          expectedOutput: `[DOWNLOAD] Requesting Piece #0 (512 KB, 32 blocks of 16KB)
+[PIPELINE] Dispatched 5 concurrent block requests...
+[PROGRESS] Blocks received: [================================] 32/32 (100%)
+[VERIFY] Computing SHA-1 of assembled 524,288 bytes...
+[VERIFY] Calculated SHA-1: 9f41b2a... MATCHES torrent metainfo!
+[DISK] Written 524,288 bytes directly to disk at offset 0x00000000.
+[PASS] Phase 4 Pipelined block downloading and cryptographic integrity verification verified!`,
+          edgeCasesAndPitfalls: [
+            'The final piece is usually smaller than piece_length: calculate exact remainder bytes for the last block.',
+            'Slow peers: implement a 5-second block request timeout; if a peer fails to return a block, cancel and request from another peer.'
+          ]
+        }
+      ],
       dataStructures: [
         {
-          name: 'Peer Wire Message Header',
-          description: 'Framing format for all BitTorrent peer communication.',
+          name: '68-Byte Peer Wire Handshake Layout',
+          description: 'Universal BitTorrent binary handshake layout including protocol string length, identifier, reserved flags, info hash, and peer ID.',
           asciiDiagram: `
-+-------------------------------------------------------------+
-| 4-byte Message Length | 1-byte Message ID | Payload Bytes   |
-+-------------------------------------------------------------+`
++-------------------------------------------------------------------+
+| 0x13 (1B) | "BitTorrent protocol" (19B) | Reserved (8B 0x00)      |
++-------------------------------------------------------------------+
+| 20-Byte Binary info_hash (Matching torrent metainfo)              |
++-------------------------------------------------------------------+
+| 20-Byte Binary peer_id (Client instance identifier)              |
++-------------------------------------------------------------------+`
+        },
+        {
+          name: 'Peer Wire Message Header & Framing',
+          description: 'Framing format for all BitTorrent peer communication following the handshake.',
+          asciiDiagram: `
++-------------------------------------------------------------------+
+| 4-byte Message Length (BE) | 1-byte Message ID | Payload Bytes    |
++-------------------------------------------------------------------+
+| Example: ID 6 Request                                             |
+| uint32_t piece_index | uint32_t byte_begin | uint32_t block_len   |
++-------------------------------------------------------------------+`
         }
       ],
       keySyscalls: [
-        { syscall: 'connect', signature: 'int connect(int sockfd, struct sockaddr *addr, ...);', purpose: 'Connects to peer TCP sockets.' },
-        { syscall: 'pwrite', signature: 'ssize_t pwrite(int fd, void *buf, size_t count, off_t offset);', purpose: 'Writes verified pieces directly to disk offsets.' }
+        { syscall: 'connect', signature: 'int connect(int sockfd, struct sockaddr *addr, ...);', purpose: 'Establishes TCP connections to peers in the swarm.' },
+        { syscall: 'pwrite', signature: 'ssize_t pwrite(int fd, void *buf, size_t count, off_t offset);', purpose: 'Writes verified pieces directly to disk offsets without seek race conditions.' },
+        { syscall: 'select', signature: 'int select(int nfds, fd_set *readfds, ...);', purpose: 'Monitors multiple peer sockets simultaneously for block readability.' }
       ],
-      commonPitfalls: ['Requesting too many blocks at once: Keep a pipeline window of 4-5 blocks per peer.'],
+      commonPitfalls: [
+        'Re-encoding the bencoded info dict: Always hash the raw byte slice directly from the original torrent file.',
+        'Requesting entire pieces at once: Requesting 512KB pieces triggers choking; you MUST divide pieces into 16KB sub-blocks.',
+        'Ignoring network byte order: BitTorrent integer fields are strictly Big-Endian (!I).',
+        'Failing to handle variable last piece size: The last piece of a file is almost never an exact multiple of piece_length.'
+      ],
       visualizerType: 'torrent'
     },
     hints: {
@@ -1095,23 +1602,298 @@ CPU state verified! Ready for Milestone 2.`
       }
     ],
     theory: {
-      highLevelArchitecture: 'A CPU does not know what a variable, a function, or an if-statement is. It only knows instructions: numbers representing opcodes. The fetch-decode-execute loop cycles billions of times per second to move bits between registers and memory.',
-      mentalModel: 'A clock ticking continuously. On each tick, you read the page number on your index finger (PC), read the recipe instruction (Opcode), adjust your kitchen scales (Registers), and turn to the next page.',
+      highLevelArchitecture: 'A Bytecode Virtual Machine simulates physical computer hardware entirely in software. Real microprocessors (such as x86_64 and ARM64) operate on a fundamental Von Neumann architecture: a shared memory bus holding code and data, a bank of high-speed register cells, an Arithmetic Logic Unit (ALU), and a Program Counter (PC) driving an endless Fetch-Decode-Execute cycle. By constructing an instruction set architecture (ISA) with 32-bit fixed-width instruction words, we simulate registers (R0-R7), a flags register (Zero, Sign, Overflow), a 64KB RAM address space, and a downward-growing call stack. We pair the VM with a two-pass binary assembler that translates human-readable assembly text into raw executable bytecode.',
+      mentalModel: 'Think of an antique punch-card music box or player piano. The paper roll (RAM Code Segment) feeds past a brass reading bar (the Program Counter). Holes punched in the roll trigger mechanical levers (Opcode Decoder) that strike specific bells (ALU Arithmetic) or rewind the paper roll backward (JMP loop). The machine has no concept of music, melody, or art; it blindly executes the physical mechanical movement dictated by the holes on each tick of the clock.',
+      deepDiveConcepts: [
+        {
+          title: 'Stack-Based vs Register-Based Virtual Machines',
+          tag: 'Compiler Design & Computer Architecture',
+          coreConcept: 'Stack machines (JVM, WASM) have zero-operand instructions and compact bytecode; Register machines (Lua, Dalvik, RISC-V) require fewer instructions and less dispatch overhead.',
+          inDepthExplanation: `When designing a Virtual Machine or compiler target, systems architects choose between two execution models:
+
+1. Stack-Based Machines (e.g. JVM, Python CPython, WebAssembly):
+All operations push and pop operands from an evaluation stack. To compute a = b + c:
+  PUSH b
+  PUSH c
+  ADD
+  POP a
+- Pros: Bytecode is very compact (1 byte per opcode, operands are implicit). Extremely simple for compilers to emit code without register allocation algorithms.
+- Cons: High dispatch overhead. The VM must execute 4 separate fetch-decode cycles for a single addition, with heavy memory traffic pushing and popping the stack.
+
+2. Register-Based Machines (e.g. Lua 5+, Android Dalvik/ART, ARM, x86_64):
+Instructions explicitly name source and destination registers. To compute a = b + c:
+  ADD R1, R2, R3
+- Pros: Reduces the total number of executed instructions by ~35-45%. Greatly reduces the interpreter switch-case dispatch loop overhead, resulting in 2x-3x higher raw execution speed.
+- Cons: Instruction words are wider (32 bits), and compilers must implement graph-coloring register allocation algorithms to map thousands of variables into 8 physical registers.`,
+          asciiDiagram: `
+STACK-BASED (4 INSTRUCTIONS):         REGISTER-BASED (1 INSTRUCTION):
+[ PUSH R1 ]                           [ ADD R3, R1, R2 ]
+[ PUSH R2 ]                             -> R3 = R1 + R2 in single dispatch!
+[ ADD     ]
+[ POP R3  ]`
+        },
+        {
+          title: 'The Fetch-Decode-Execute Cycle & Dispatch Penalties',
+          tag: 'CPU Pipeline & Microarchitecture',
+          coreConcept: 'CPUs execute an infinite loop: fetch instruction at PC, decode bitfields into control signals, execute ALU logic, and increment PC.',
+          inDepthExplanation: `At the heart of every CPU is the 3-step execution loop:
+1. Fetch: Read the 32-bit integer located at memory address PC: inst = memory[PC]; PC += 4;
+2. Decode: Slice the 32-bit word using bit shifts and bitwise AND masks to extract the 8-bit Opcode, 4-bit Destination Register, 4-bit Source Register, and 16-bit Immediate value.
+3. Execute: Dispatch the operation via a switch-case statement or function pointer table.
+
+The Interpreter Dispatch Penalty:
+In real hardware, CPU branch predictors guess which instruction comes next. In a software VM interpreter with a large switch(opcode) statement, modern CPU branch predictors struggle because the switch jump target changes unpredictably on every iteration! This causes frequent CPU pipeline flushes. Advanced VMs (like LuaJIT or the Linux BPF JIT) mitigate this using Direct Threaded Code (computed goto statements) or Just-In-Time compilation to native x86 machine code.`,
+          codeSnippet: `// The Core CPU Step Loop
+void cpu_step(cpu_t* cpu) {
+    uint32_t inst = *(uint32_t*)&cpu->memory[cpu->pc];
+    cpu->pc += 4; // Advance PC to next 32-bit word
+
+    uint8_t opcode = (inst >> 24) & 0xFF;
+    uint8_t r_dest = (inst >> 20) & 0x0F;
+    uint8_t r_src  = (inst >> 16) & 0x0F;
+    int16_t imm    = (int16_t)(inst & 0xFFFF); // Sign-extended 16-bit immediate
+
+    switch (opcode) {
+        case OP_ADD: cpu->regs[r_dest] += cpu->regs[r_src]; break;
+        case OP_LOAD_IMM: cpu->regs[r_dest] = imm; break;
+        case OP_JMP: cpu->pc = (uint16_t)imm; break;
+        case OP_HALT: cpu->is_running = 0; break;
+    }
+}`
+        },
+        {
+          title: 'ALU Flags Register & Conditional Branching',
+          tag: 'Digital Logic & Computer Arithmetic',
+          coreConcept: 'All high-level control flow (if/else, while, for loops) compiles down to arithmetic comparisons that set CPU flags, followed by conditional jump instructions.',
+          inDepthExplanation: `How does a computer make decisions?
+A CPU does not have an "if" instruction. Instead, it pairs a comparison instruction with conditional jump instructions.
+
+The Arithmetic Logic Unit (ALU) maintains a Flags Register containing status bits:
+- Zero Flag (ZF): Set to 1 if the result of the last operation was 0.
+- Sign Flag (SF): Set to 1 if the result was negative (most significant bit is 1).
+- Overflow Flag (OF): Set to 1 if signed integer arithmetic overflowed.
+
+Example: Compiling "if (R1 == 10) goto target;"
+1. CMP R1, 10: The ALU internally computes R1 - 10. It discards the numerical result, but updates the flags! If R1 was 10, the subtraction equals 0, so ZF is set to 1.
+2. JEQ target (Jump if Equal): The CPU inspects ZF. If ZF == 1, it overwrites PC = target! If ZF == 0, PC continues to the next sequential instruction.`,
+          asciiDiagram: `
+ALU FLAG EVALUATION:
+[ CMP R1, R2 ] ===> Computes (R1 - R2)
+                      |
+                      +---> Result == 0 ? ZF = 1 (Equal)
+                      +---> Result < 0  ? SF = 1 (Less Than)
+                      |
+[ JEQ target ] <------+ Inspects ZF:
+                      If ZF == 1: PC = target (Branch Taken!)
+                      If ZF == 0: PC += 4     (Fallthrough)`
+        },
+        {
+          title: 'The Call Stack Frame ABI & Function Recursion',
+          tag: 'Systems Programming & ABIs',
+          coreConcept: 'Function calls require saving the return address and base pointer on a downward-growing stack to support nested recursion.',
+          inDepthExplanation: `When a program calls a function (e.g. fibonacci(n)), the CPU must jump to the function code, execute it, and return back to the exact instruction after the call site.
+
+The Call Stack Architecture:
+- Stack Pointer (SP): Points to the current top of the stack in RAM (starts at high memory, e.g. 0xFFFF, and grows downward).
+- CALL target instruction:
+  1. Decrement SP by 4.
+  2. Write the return address (PC + 4) to memory at [SP].
+  3. Overwrite PC = target.
+- RET instruction:
+  1. Read return address from memory at [SP].
+  2. Increment SP by 4.
+  3. Overwrite PC = return address.
+
+To support local variables and recursion without variable clobbering, modern ABIs establish a Base Pointer (BP) frame: PUSH BP; BP = SP; SP -= local_vars_size. This guarantees each recursive call receives an isolated stack frame!`,
+          asciiDiagram: `
+CALL STACK FRAME LAYOUT:
+High Memory (0xFFFF) --------------------------------+
+                     | Caller Stack Frame            |
+                     +-------------------------------+
+                     | Return Address (PC after call)| <--- PUSHED BY CALL
+                     +-------------------------------+
+                     | Saved Base Pointer (Old BP)   | <--- PUSHED BY PROLOGUE
+                     +-------------------------------+
+                     | Local Variable 1 (e.g. n)     |
+                     | Local Variable 2 (e.g. temp)  |
+Low Memory (SP) ---->+-------------------------------+ <--- CURRENT SP`
+        }
+      ],
+      executionRoadmap: [
+        {
+          phaseNumber: 1,
+          phaseTitle: 'CPU Registers, 64KB RAM Bus & Instruction Fetch Loop',
+          summary: 'Define the 32-bit CPU state struct, allocate a 64KB memory bus, and implement the fetch-decode-execute loop with basic arithmetic opcodes.',
+          architectureDeepDive: 'In this phase, we build the core virtual processor. We define 8 general-purpose 32-bit registers (R0 through R7), a 16-bit Program Counter (PC), and a 64KB byte array acting as RAM. We implement the basic fetch loop: reading 4 bytes at PC, slicing opcode and register operands, and updating registers.',
+          visualWorkflowAscii: `
+Fetch-Decode Cycle:
+PC (0x0000) -> Fetch 4 Bytes: [ 0x01 | 0x01 | 0x00 | 0x2A ]
+                                   |      |      |      |
+                                 LOAD_IMM R1   Unused   42
+                                   |
+                             R1 = 42; PC += 4 (0x0004)`,
+          concreteExecutionSteps: [
+            'Create vm.h and vm.c defining struct cpu with regs[8], pc, sp, flags, memory[65536], is_running.',
+            'Define opcodes: OP_HALT (0x00), OP_LOAD_IMM (0x01), OP_ADD (0x02), OP_SUB (0x03), OP_MOV (0x04).',
+            'Implement cpu_init(cpu) setting registers to 0, pc to 0, sp to 0xFFFF, is_running to 1.',
+            'Implement cpu_step(cpu): fetch 32-bit word, decode opcode, r_dest, r_src, imm.',
+            'Write test program in memory: load 10 into R1, load 20 into R2, ADD R1, R2, HALT.',
+            'Assert that R1 equals 30 after CPU halts.'
+          ],
+          verificationCommand: 'gcc -Wall -O2 vm.c test_vm.c -o test_vm && ./test_vm',
+          expectedOutput: `[VM] CPU initialized: 8 registers, 64KB RAM, SP @ 0xFFFF
+[EXEC] PC: 0x0000 -> LOAD_IMM R1, 10
+[EXEC] PC: 0x0004 -> LOAD_IMM R2, 20
+[EXEC] PC: 0x0008 -> ADD R1, R2 (R1: 30)
+[EXEC] PC: 0x000C -> HALT
+[PASS] Phase 1 Virtual CPU core and ALU register arithmetic verified!`,
+          edgeCasesAndPitfalls: [
+            'Endianness when fetching 32-bit words: ensure Big-Endian packing (inst = (mem[0] << 24) | (mem[1] << 16) | ...) matches assembler output.',
+            'PC out of bounds: assert pc + 4 <= 65536 to prevent memory access violations.'
+          ]
+        },
+        {
+          phaseNumber: 2,
+          phaseTitle: 'ALU Comparison Flags & Conditional Jump Branches',
+          summary: 'Implement CMP instruction, Zero Flag (ZF) and Sign Flag (SF) registers, and branching opcodes (JMP, JEQ, JNE, JLT).',
+          architectureDeepDive: 'We introduce Turing completeness by implementing control flow. The CMP instruction performs a subtraction without saving the result, setting ZF = (diff == 0) and SF = (diff < 0). Conditional jump instructions inspect these flags: if matched, PC is overwritten with the target address; otherwise execution falls through.',
+          visualWorkflowAscii: `
+Branching Loop (Counter from 5 down to 0):
+0x0000: LOAD_IMM R1, 5
+0x0004: SUB_IMM  R1, 1     <-------+
+0x0008: CMP      R1, 0             | JNE Loop (0x0004)
+0x000C: JNE      0x0004   ---------+
+0x0010: HALT`,
+          concreteExecutionSteps: [
+            'Add flags uint8_t to cpu_t: bit 0 = ZF, bit 1 = SF.',
+            'Implement OP_CMP: diff = regs[r1] - regs[r2]; ZF = (diff == 0); SF = (diff < 0).',
+            'Implement OP_JMP: cpu->pc = imm.',
+            'Implement OP_JEQ: if (cpu->flags & FLAG_ZF) cpu->pc = imm.',
+            'Implement OP_JNE: if (!(cpu->flags & FLAG_ZF)) cpu->pc = imm.',
+            'Write loop decrementing R1 from 5 to 0; assert loop executes exactly 5 times.'
+          ],
+          verificationCommand: 'gcc -Wall -O2 vm.c test_branch.c -o test_branch && ./test_branch',
+          expectedOutput: `[BRANCH] Running countdown loop from 5 to 0...
+[LOOP] Iteration 1: R1 = 4
+[LOOP] Iteration 2: R1 = 3
+[LOOP] Iteration 3: R1 = 2
+[LOOP] Iteration 4: R1 = 1
+[LOOP] Iteration 5: R1 = 0 (ZF Flag Triggered!)
+[BRANCH] JNE fallthrough to HALT.
+[PASS] Phase 2 ALU comparison flags and conditional branching verified!`,
+          edgeCasesAndPitfalls: [
+            'Signed vs unsigned comparison: cast to int32_t before subtraction to handle negative values correctly.',
+            'Infinite loops: always provide a max_steps safeguard during unit tests.'
+          ]
+        },
+        {
+          phaseNumber: 3,
+          phaseTitle: 'Hardware Call Stack ABI (CALL / RET)',
+          summary: 'Implement a downward-growing stack in memory, support PUSH, POP, CALL, and RET, and enable nested function calls.',
+          architectureDeepDive: 'In this phase, we add subroutine capabilities. The Stack Pointer (SP) begins at 0xFFFF. The CALL target instruction decrements SP by 4, writes the return address (PC) to memory at [SP], and jumps to target. The RET instruction pops the return address off [SP] and jumps back to the caller.',
+          visualWorkflowAscii: `
+Function Call & Return ABI:
+Main @ 0x0010: CALL 0x0050
+  |
+  +---> Push Return Address (0x0014) onto Stack @ SP (0xFFFC)
+  +---> Jump PC = 0x0050 (Subroutine executes)
+  |
+Subroutine @ 0x0070: RET
+  |
+  +---> Pop Return Address (0x0014) off Stack -> SP resets to 0x10000
+  +---> Jump PC = 0x0014 (Resume Main!)`,
+          concreteExecutionSteps: [
+            'Implement OP_PUSH r1: cpu->sp -= 4; *(uint32_t*)&cpu->memory[cpu->sp] = cpu->regs[r1].',
+            'Implement OP_POP r1: cpu->regs[r1] = *(uint32_t*)&cpu->memory[cpu->sp]; cpu->sp += 4.',
+            'Implement OP_CALL: push current PC to stack; cpu->pc = imm.',
+            'Implement OP_RET: pop return address from stack; cpu->pc = return_addr.',
+            'Verify nested function call: main calls func1, func1 calls func2, func2 returns to func1, func1 returns to main.'
+          ],
+          verificationCommand: 'gcc -Wall -O2 vm.c test_call.c -o test_call && ./test_call',
+          expectedOutput: `[CALL] Main (PC: 0x0010) calling func_add (0x0040)...
+[STACK] Pushed return address 0x0014 @ SP: 0xFFFC
+[FUNC] Inside func_add: R1 = R1 + R2 (Result = 42)
+[RET] Returning to caller @ 0x0014...
+[MAIN] Resumed in main! Result verified: 42
+[PASS] Phase 3 Hardware call stack ABI and function recursion verified!`,
+          edgeCasesAndPitfalls: [
+            'Stack Overflow: if SP reaches the code segment boundary (< 0x1000), abort with Stack Overflow Fault.',
+            'Stack Underflow: calling RET when the stack is empty (SP > 0xFFFF) must trigger an error.'
+          ]
+        },
+        {
+          phaseNumber: 4,
+          phaseTitle: 'Two-Pass Binary Assembler & Fibonacci Execution',
+          summary: 'Build a two-pass assembler translating assembly text with labels to binary bytecode, load into VM RAM, and compute Fibonacci(10).',
+          architectureDeepDive: 'In this culminating phase, we build the compiler toolchain. The assembler scans the source file in two passes: Pass 1 records label definitions (e.g. loop:) and their byte offsets in a symbol table. Pass 2 parses instruction mnemonics, encodes 32-bit binary words, and resolves label references into concrete addresses. We then run a complete iterative Fibonacci program.',
+          visualWorkflowAscii: `
+Two-Pass Assembler Pipeline:
+Assembly Text:                   Pass 1 (Symbol Table):
+  LOAD_IMM R1, 10                "loop" -> Address 0x0008
+loop:                            "exit" -> Address 0x0024
+  ADD R2, R1                     
+  JMP loop                       Pass 2 (Binary Bytecode):
+                                 Emit 32-bit words with resolved addresses!
+                                 Write program.bin -> Load into VM RAM -> EXECUTE!`,
+          concreteExecutionSteps: [
+            'Create asm.py (Mini-Assembler).',
+            'Pass 1: Tokenize lines, track current byte offset (starts 0, increments +4 per instruction), store labels in symbols dict.',
+            'Pass 2: Parse instructions, lookup label target addresses, pack into 32-bit big-endian words with struct.pack(">I", word).',
+            'Write binary file: program.bin.',
+            'Write Fibonacci assembly program calculating Fib(10) = 55 in R1.',
+            'Load program.bin into VM memory and run until HALT.',
+            'Assert that R1 equals 55 upon completion.'
+          ],
+          verificationCommand: 'python3 asm.py fibonacci.asm program.bin && gcc -O2 vm.c -o vm && ./vm program.bin',
+          expectedOutput: `[ASM] Pass 1: Generated symbol table: {'start': 0, 'fib_loop': 12, 'done': 32}
+[ASM] Pass 2: Assembled 9 instructions (36 bytes) -> program.bin
+[VM] Loaded 36 bytes of bytecode into RAM @ 0x0000
+[EXEC] Running bytecode execution loop...
+[HALT] Program halted after 48 clock cycles.
+[REGISTERS] R0: 0  | R1: 55 (10th Fibonacci Number!) | R2: 89 | R3: 0
+[PASS] Phase 4 Two-pass assembler and Fibonacci execution verified with zero hardware faults!`,
+          edgeCasesAndPitfalls: [
+            'Undefined symbols: raise clear assembler error if an unknown label is referenced in Pass 2.',
+            'Immediate truncation: ensure immediates fit within signed 16-bit range (-32768 to 32767).'
+          ]
+        }
+      ],
       dataStructures: [
         {
           name: '32-Bit Instruction Encoding Format',
-          description: 'Packed instruction word decoded by the CPU.',
+          description: 'Fixed-width instruction word divided into an 8-bit opcode, 4-bit destination register, 4-bit source register, and 16-bit immediate value.',
           asciiDiagram: `
  0      7 8    11 12   15 16                          31
 +--------+-------+-------+------------------------------+
 | Opcode |  RegA |  RegB |    Immediate 16-bit Value    |
+| (8-Bit)| (4-Bit| (4-Bit| (Signed 16-Bit Integer)      |
 +--------+-------+-------+------------------------------+`
+        },
+        {
+          name: 'CPU State Machine Struct',
+          description: 'Represents physical microprocessor hardware: registers, execution flags, program counter, stack pointer, and 64KB RAM bus.',
+          asciiDiagram: `
++-------------------------------------------------------------------+
+| cpu_t                                                             |
+|   uint32_t regs[8];       // General purpose registers R0-R7       |
+|   uint16_t pc;            // Program Counter (0x0000 - 0xFFFF)    |
+|   uint16_t sp;            // Stack Pointer (starts 0xFFFF)        |
+|   uint8_t flags;          // Bit 0: ZF (Zero), Bit 1: SF (Sign)   |
+|   uint8_t memory[65536];  // 64 Kilobyte RAM Address Space        |
+|   int is_running;         // 1 = Clock Ticking, 0 = Halted        |
++-------------------------------------------------------------------+`
         }
       ],
       keySyscalls: [
-        { syscall: 'none (bare metal)', signature: 'void cpu_step(cpu_t *cpu);', purpose: 'Self-contained algorithmic execution loop.' }
+        { syscall: 'none (bare metal CPU)', signature: 'void cpu_step(cpu_t *cpu);', purpose: 'Self-contained algorithmic instruction execution loop operating directly on virtual RAM.' },
+        { syscall: 'clock_gettime', signature: 'int clock_gettime(CLOCK_MONOTONIC, struct timespec *ts);', purpose: 'Used for benchmarking Millions of Instructions Per Second (MIPS).' }
       ],
-      commonPitfalls: ['Stack overflow: Ensure stack operations check if SP exceeds allocated bounds.'],
+      commonPitfalls: [
+        'Stack overflow / underflow: Failing to check if SP goes out of bounds will corrupt the code segment or crash.',
+        'Endianness mismatch: Encoding big-endian in assembler and decoding little-endian in VM produces nonsensical opcodes.',
+        'Sign extension bugs: Negative 16-bit immediates (e.g. -1) must be cast to signed int16_t before sign-extending to 32-bit registers.',
+        'Off-by-one PC jumps: Incrementing PC after jump execution causes the CPU to skip the first instruction of the target branch.'
+      ],
       visualizerType: 'vm'
     },
     hints: {
@@ -1478,12 +2260,285 @@ server.listen(PORT, () => {
       }
     ],
     theory: {
-      highLevelArchitecture: 'WebSockets start as a standard HTTP/1.1 GET request with an `Upgrade: websocket` header. Once the server returns `101 Switching Protocols`, both sides stop talking HTTP and start communicating via lightweight binary frames with only 2 to 10 bytes of header overhead.',
-      mentalModel: 'A phone call that starts with an operator asking for your account ID (HTTP Handshake), and once verified, puts you through directly to a dedicated open audio line (Raw WebSocket stream).',
+      highLevelArchitecture: 'The RFC 6455 WebSocket protocol transforms the World Wide Web from a half-duplex request-response model into a persistent, full-duplex, bidirectional communication pipeline over a single TCP socket. Traditional HTTP polling wastes immense bandwidth: every request re-transmits 800+ bytes of HTTP headers (User-Agent, Cookies, Accept) to fetch a 10-byte coordinate update, incurring 50-100ms latency. WebSockets begin with a standard HTTP/1.1 handshake negotiated via an "Upgrade: websocket" header. Once the server accepts by returning "101 Switching Protocols" along with a cryptographic SHA-1 hash of the client key, the TCP socket switches from HTTP to a minimal binary framing protocol that transmits updates with only 2 to 10 bytes of header overhead and sub-millisecond latency.',
+      mentalModel: 'Imagine two people sending letters back and forth through the postal service: each letter requires an envelope, stamps, addresses, and takes 3 days to arrive (HTTP Request/Response). A WebSocket is like picking up the phone and establishing an open copper wire intercom. Once connected, either person can speak at any millisecond without ever licking an envelope again (Full-Duplex Streaming).',
+      deepDiveConcepts: [
+        {
+          title: 'The RFC 6455 Handshake & The Magic GUID',
+          tag: 'Cryptographic Protocol Handshake',
+          coreConcept: 'The HTTP Upgrade handshake proves to both the client and intermediate proxies that the server specifically supports RFC 6455, preventing cache poisoning attacks.',
+          inDepthExplanation: `A WebSocket connection begins as a standard HTTP/1.1 GET request:
+GET /canvas HTTP/1.1
+Host: localhost:8080
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+
+The Server Handshake Algorithm:
+1. Extract the value of the Sec-WebSocket-Key header (a 16-byte random nonce base64-encoded by the browser).
+2. Concatenate the key with the globally unique Magic GUID defined by RFC 6455:
+   GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+3. Compute the SHA-1 cryptographic hash of the combined string.
+4. Base64-encode the raw SHA-1 digest.
+5. Return an HTTP 101 Switching Protocols response:
+HTTP/1.1 101 Switching Protocols\\r\\n
+Upgrade: websocket\\r\\n
+Connection: Upgrade\\r\\n
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\\r\\n\\r\\n
+
+Why the Magic GUID?
+It guarantees that the server deliberately intended to open a WebSocket connection. A regular HTTP caching proxy will NOT have this hardcoded GUID and therefore cannot mistakenly cache or spoof the 101 response.`,
+          mathOrAlgorithm: `Handshake Derivation Formula:
+client_key = "dGhlIHNhbXBsZSBub25jZQ=="
+magic_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+accept_key = Base64(SHA1(client_key + magic_guid))
+Result: "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="`,
+          codeSnippet: `// Handshake key computation in Node.js
+const crypto = require('crypto');
+function computeAcceptKey(clientKey) {
+    const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+    return crypto
+        .createHash('sha1')
+        .update(clientKey + GUID)
+        .digest('base64');
+}`
+        },
+        {
+          title: 'WebSocket Binary Framing & Variable Length Fields',
+          tag: 'Binary Wire Protocols',
+          coreConcept: 'WebSocket frames pack flags, opcodes, mask keys, and variable payload lengths into a bit-level binary header ranging from 2 to 14 bytes.',
+          inDepthExplanation: `Unlike HTTP plain-text headers, WebSocket frames operate at the bit level:
+
+Byte 0:
+- Bit 0: FIN (1 bit). 1 indicates this is the final fragment of a message; 0 indicates more fragments follow.
+- Bits 1-3: RSV1, RSV2, RSV3 (1 bit each). Reserved for extensions (must be 0).
+- Bits 4-7: Opcode (4 bits). Defines payload interpretation:
+  * 0x1: Text (UTF-8 encoded string)
+  * 0x2: Binary (raw byte buffer)
+  * 0x8: Connection Close
+  * 0x9: Ping (heartbeat probe)
+  * 0xA: Pong (heartbeat response)
+
+Byte 1:
+- Bit 0: MASK (1 bit). Indicates whether the payload is XOR-masked (1 from client, 0 from server).
+- Bits 1-7: Payload Length (7 bits):
+  * If 0 to 125: That is the exact payload size in bytes.
+  * If 126: The payload size is contained in the NEXT 2 bytes (16-bit uint, up to 64KB).
+  * If 127: The payload size is contained in the NEXT 8 bytes (64-bit uint, up to 18 Exabytes!).`,
+          asciiDiagram: `
+RFC 6455 BINARY FRAME BITMAP:
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-------+-+-------------+-------------------------------+
+|F|R|R|R| opcode|M| Payload len |    Extended payload length    |
+|I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
+|N|V|V|V|       |S|             |   (if payload len==126/127)   |
++-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - - +
+|     Masking-key (4 bytes, only if MASK==1, from client)       |
++---------------------------------------------------------------+
+|                     Payload Data (unmasked via XOR)           |
++---------------------------------------------------------------+`
+        },
+        {
+          title: 'Why Clients Must Mask and Servers Must NOT Mask',
+          tag: 'Network Security & Cache Poisoning',
+          coreConcept: 'Clients must XOR-mask every outgoing frame to prevent malicious scripts from poisoning transparent HTTP proxy caches; servers must never mask.',
+          inDepthExplanation: `A profound security insight in the design of RFC 6455 is the masking rule:
+- Every frame sent from a browser (client) to a server MUST have MASK=1 and provide a random 4-byte masking key.
+- Every frame sent from a server to a browser MUST have MASK=0. If a server masks a frame, the browser will instantly drop the connection with a protocol error!
+
+Why is masking mandatory for clients?
+Imagine an evil webpage runs JavaScript: ws.send("GET /sensitive-data HTTP/1.1\\r\\n..."). If the browser wrote raw bytes onto the TCP connection, an outdated or transparent HTTP proxy cache between the user and the internet might mistake the WebSocket stream for genuine HTTP requests and poison its cache with sensitive stolen data!
+
+By XORing every byte with a fresh, unpredictable 4-byte random key:
+unmasked_byte = masked_byte ^ mask_key[i % 4]
+The bytes traveling across the physical internet look like complete high-entropy white noise. Intermediate proxy caches cannot recognize HTTP strings and simply pass the bytes through untouched.`,
+          mathOrAlgorithm: `Bitwise XOR Unmasking Algorithm:
+For byte index i from 0 to payload_length - 1:
+  decoded_byte[i] = raw_payload[i] XOR masking_key[i % 4]
+
+Property: (A ^ B) ^ B == A  (XOR is self-reversing!)`,
+          codeSnippet: `// Bitwise XOR unmasking in JavaScript / Node.js
+function unmaskPayload(payloadBuffer, maskKey) {
+    const result = Buffer.alloc(payloadBuffer.length);
+    for (let i = 0; i < payloadBuffer.length; i++) {
+        result[i] = payloadBuffer[i] ^ maskKey[i % 4];
+    }
+    return result;
+}`
+        },
+        {
+          title: 'Real-Time Fanout Architecture & Vector CRDTs',
+          tag: 'Distributed Systems & Real-Time Sync',
+          coreConcept: 'Collaborative canvases synchronize vector stroke operations (not raw pixel rasters) using client fanout hubs and monotonic sequence timestamps.',
+          inDepthExplanation: `If you have 50 users drawing simultaneously on a 1920x1080 canvas, streaming the raw image pixels consumes over 500 Megabytes per second of bandwidth and causes unbearable lag.
+
+Instead, we stream Vector Path Operations:
+When a user drags their mouse, the frontend emits a continuous stream of vector segments:
+{ type: "draw", id: "user_a", x0: 120, y0: 45, x1: 128, y1: 52, color: "#10b981", width: 4 }
+
+The Broadcast Fanout Hub:
+1. The server maintains a Set of active client WebSocket connections.
+2. When Client A sends an unmasked draw stroke, the server serializes the message into an unmasked server frame (Byte 0: 0x81 for text, Byte 1: payload length).
+3. The server iterates over all clients in the set: if client !== sender, write the frame directly to their socket.
+4. Each connected browser receives the vector coordinate and invokes canvas context.lineTo(x1, y1); context.stroke() in single-digit milliseconds.`,
+          asciiDiagram: `
+VECTOR BROADCAST FANOUT HUB:
+User A Draws Stroke (Client A)
+              |
+              v (Masked WebSocket Frame)
+    [ WebSocket Server ] (Unmasks Frame)
+              |
+              +---> Broadcast to Client B (Unmasked Frame) ---> Tab B renders stroke!
+              +---> Broadcast to Client C (Unmasked Frame) ---> Tab C renders stroke!
+              +---> Broadcast to Client D (Unmasked Frame) ---> Tab D renders stroke!`
+        }
+      ],
+      executionRoadmap: [
+        {
+          phaseNumber: 1,
+          phaseTitle: 'HTTP Upgrade Gateway & Handshake Acceptance',
+          summary: 'Listen on port 8080, intercept incoming HTTP GET requests with Upgrade: websocket, calculate the SHA-1 accept key, and return 101 Switching Protocols.',
+          architectureDeepDive: 'In this phase, we establish the WebSocket connection. We create a standard TCP server on port 8080. When a browser connects with new WebSocket("ws://localhost:8080"), it transmits an HTTP upgrade request. We parse the headers, extract Sec-WebSocket-Key, compute the SHA-1 hash with the Magic GUID, and return the HTTP 101 response.',
+          visualWorkflowAscii: `
+WebSocket Handshake:
+Browser ---> GET / HTTP/1.1 (Upgrade: websocket, Sec-WebSocket-Key: ...)
+               |
+               v Handshake Calculator
+Server  <--- HTTP/1.1 101 Switching Protocols (Sec-WebSocket-Accept: ...)
+  |
+  +---> Socket switches from HTTP to Raw WebSocket Binary Stream!`,
+          concreteExecutionSteps: [
+            'Create server.js (or server.py / server.c) listening on TCP port 8080.',
+            'Listen for initial data: parse HTTP request headers.',
+            'Verify headers contain "Upgrade: websocket" and "Sec-WebSocket-Key".',
+            'Compute accept_key = Base64(SHA1(client_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")).',
+            'Send HTTP response: "HTTP/1.1 101 Switching Protocols\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\nSec-WebSocket-Accept: " + accept_key + "\\r\\n\\r\\n".',
+            'Keep the socket open; do NOT close it!'
+          ],
+          verificationCommand: 'node server.js & sleep 1 && node -e "const ws = new (require(\'ws\'))(\'ws://localhost:8080\'); ws.on(\'open\', () => { console.log(\'Handshake SUCCESS: WebSocket Connected!\'); ws.close(); process.exit(0); });" && killall node',
+          expectedOutput: `[SERVER] WebSocket gateway listening on ws://localhost:8080
+[HANDSHAKE] Intercepted Upgrade request from client.
+[KEY] Client Key: dGhlIHNhbXBsZSBub25jZQ==
+[ACCEPT] Computed Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+[STATUS] Sent HTTP 101 Switching Protocols -> Socket upgraded!
+Handshake SUCCESS: WebSocket Connected!
+[PASS] Phase 1 HTTP upgrade gateway and cryptographic handshake verified!`,
+          edgeCasesAndPitfalls: [
+            'Closing the socket after sending HTTP 101: WebSockets require keeping the exact same TCP socket open indefinitely.',
+            'Whitespace or missing newlines: HTTP header responses must terminate strictly with \\r\\n\\r\\n.'
+          ]
+        },
+        {
+          phaseNumber: 2,
+          phaseTitle: 'Binary Frame Parser & XOR Unmasking Engine',
+          summary: 'Parse incoming binary WebSocket frames, extract FIN flag and opcode, decode 7-bit/16-bit payload lengths, and unmask payloads using 4-byte XOR keys.',
+          architectureDeepDive: 'Once upgraded, all data arrives as binary frames. We parse Byte 0 to extract the opcode (0x1 for text, 0x8 for close, 0x9 for ping). We parse Byte 1 to check the Mask bit and read payload length. If length is 126, we read the next 2 bytes. We extract the 4-byte masking key and execute the XOR unmasking formula.',
+          visualWorkflowAscii: `
+Binary Frame Decoding:
+Byte 0: [ FIN: 1 | Opcode: 0x1 (Text) ]
+Byte 1: [ MASK: 1 | Length: 12 ]
+Bytes 2-5: [ 4-Byte Masking Key: 0xA1, 0xB2, 0xC3, 0xD4 ]
+Bytes 6-17: [ Masked Payload Bytes ]
+                 |
+                 v XOR Unmasking
+Decoded UTF-8: '{"x":12,"y":45}'`,
+          concreteExecutionSteps: [
+            'Read Byte 0: const fin = (buf[0] & 0x80) !== 0; const opcode = buf[0] & 0x0F;',
+            'Read Byte 1: const isMasked = (buf[1] & 0x80) !== 0; let payloadLen = buf[1] & 0x7F;',
+            'Handle extended length: if payloadLen === 126, read next 2 bytes (uint16); if 127, read next 8 bytes (uint64).',
+            'Read 4-byte mask key: const maskKey = buf.slice(offset, offset + 4); offset += 4;',
+            'Unmask payload: result[i] = buf[offset + i] ^ maskKey[i % 4];',
+            'If opcode === 0x8: close connection. If opcode === 0x9: reply with Pong (0xA).'
+          ],
+          verificationCommand: 'node test_frame_parser.js',
+          expectedOutput: `[PARSER] Received 18-byte client frame:
+  -> FIN: true, Opcode: 0x1 (Text)
+  -> Masked: true, Length: 12 bytes
+  -> Mask Key: [0x3f, 0x9a, 0x1c, 0x72]
+[UNMASK] Decoded string: '{"x":12,"y":45}'
+[PASS] Phase 2 Binary frame parser and XOR unmasking engine verified!`,
+          edgeCasesAndPitfalls: [
+            'Unmasked client frames: RFC 6455 states servers MUST fail the connection if a client sends an unmasked frame (MASK=0).',
+            'Fragmented frames: if FIN=0, buffer payload chunks until FIN=1 arrives before parsing JSON.'
+          ]
+        },
+        {
+          phaseNumber: 3,
+          phaseTitle: 'Multi-Client Connection Hub & Broadcast Fan-Out',
+          summary: 'Maintain an active client registry, construct server-to-client unmasked frames, and broadcast real-time messages to all connected peer tabs.',
+          architectureDeepDive: 'In this phase, we build the broadcast hub. We maintain a Set of active client sockets. When Client A sends a draw event, we wrap the message in an unmasked server frame (Byte 0: 0x81 for text, Byte 1: unmasked payload length) and iterate through the client set, writing the frame out to every client except the sender.',
+          visualWorkflowAscii: `
+Broadcast Fan-Out Loop:
+Client A writes: { x: 50, y: 80 }
+                       |
+               [ Broadcast Hub ]
+                       |
+          +------------+------------+
+          |                         |
+Client B receives frame   Client C receives frame`,
+          concreteExecutionSteps: [
+            'Create client registry: const clients = new Set();',
+            'On handshake completion: clients.add(socket);',
+            'On socket close: clients.delete(socket);',
+            'Implement createServerFrame(payloadStr): Byte 0 = 0x81 (FIN=1, Text), Byte 1 = payload.length (unmasked!), followed by payload bytes.',
+            'Implement broadcast(senderSocket, message): iterate clients; if client !== senderSocket, client.write(serverFrame).',
+            'Handle client error: remove dead sockets immediately from registry.'
+          ],
+          verificationCommand: 'node server.js & sleep 1 && node test_broadcast.js && killall node',
+          expectedOutput: `[HUB] Connected Client 1 (id: usr_1)
+[HUB] Connected Client 2 (id: usr_2)
+[BROADCAST] Client 1 transmitted draw stroke: { x: 100, y: 250 }
+[FANOUT] Forwarded unmasked server frame to Client 2 in 0.42ms.
+[CLIENT 2] Received broadcast payload: '{"x":100,"y":250}'
+[PASS] Phase 3 Multi-client registry and broadcast fanout verified!`,
+          edgeCasesAndPitfalls: [
+            'Masking outgoing server frames: NEVER mask server frames! Browsers will immediately disconnect if Byte 1 has the mask bit set.',
+            'Slow consumers: if a client socket buffer fills up, remove or throttle them to prevent stalling other users.'
+          ]
+        },
+        {
+          phaseNumber: 4,
+          phaseTitle: 'HTML5 Collaborative Canvas Frontend Integration',
+          summary: 'Build an interactive HTML5 canvas client capturing mouse drag strokes, transmitting vector coordinates over WebSockets, and rendering peer strokes.',
+          architectureDeepDive: 'In this final phase, we create client.html. We hook into canvas mouse events (mousedown, mousemove, mouseup). As the user paints, we draw on the local 2D canvas context and send JSON coordinates over the WebSocket. When messages arrive from the server, we parse the peer coordinates and invoke lineTo() to render peer strokes in real time.',
+          visualWorkflowAscii: `
+Interactive Painting Flow:
+User drags mouse on Canvas -> emit { x0, y0, x1, y1, color } -> ws.send()
+                                                                      |
+Peer browser receives message <--------------------------------- Server Fanout
+  |
+  v Canvas Rendering
+context.strokeStyle = msg.color;
+context.beginPath();
+context.moveTo(msg.x0, msg.y0);
+context.lineTo(msg.x1, msg.y1);
+context.stroke();`,
+          concreteExecutionSteps: [
+            'Create public/index.html with a full-window <canvas id="board">.</canvas>',
+            'Initialize WebSocket: const ws = new WebSocket(`ws://${location.host}`);',
+            'Track mouse states: isDrawing, lastX, lastY.',
+            'On mousemove while drawing: draw line locally, then ws.send(JSON.stringify({ x0: lastX, y0: lastY, x1: e.clientX, y1: e.clientY, color }));',
+            'On ws.onmessage: parse JSON, draw peer vector stroke on canvas.',
+            'Open two browser windows side by side and draw simultaneously.'
+          ],
+          verificationCommand: 'node server.js & sleep 1 && curl -s http://localhost:8080/ && killall node',
+          expectedOutput: `[SERVER] Serving collaborative canvas application at http://localhost:8080
+[HTTP] 200 OK -> index.html (Canvas UI loaded)
+[WS] 2 browser sessions connected to canvas hub.
+[EVENT] Peer draw stream synchronized: 240 vector strokes exchanged in real time.
+[PASS] Phase 4 Production Real-Time Collaborative Canvas fully functional!`,
+          edgeCasesAndPitfalls: [
+            'HiDPI / Retina displays: canvas pixels appear blurry unless scaled by window.devicePixelRatio.',
+            'Coordinate offset: use getBoundingClientRect() to calculate canvas relative mouse positions instead of raw screen coordinates.'
+          ]
+        }
+      ],
       dataStructures: [
         {
-          name: 'RFC 6455 Frame Header',
-          description: 'Structure of a single WebSocket frame.',
+          name: 'RFC 6455 Binary Frame Layout',
+          description: 'Standard 2-to-14 byte header layout including FIN bit, opcode, mask flag, payload length, and masking key.',
           asciiDiagram: `
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -1495,12 +2550,33 @@ server.listen(PORT, () => {
 +-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - - +
 |     Masking-key (4 bytes, only if MASK==1, from client)       |
 +---------------------------------------------------------------+`
+        },
+        {
+          name: 'Vector Draw Stroke Payload Layout',
+          description: 'Compact JSON or binary vector representation transmitted between collaborative canvas participants.',
+          asciiDiagram: `
++-------------------------------------------------------------------+
+| {                                                                 |
+|   "type": "draw",                                                 |
+|   "userId": "usr_9f41b2a",                                        |
+|   "x0": 142.5, "y0": 88.0,                                        |
+|   "x1": 150.0, "y1": 92.5,                                        |
+|   "color": "#10b981",                                             |
+|   "width": 3.0                                                    |
+| }                                                                 |
++-------------------------------------------------------------------+`
         }
       ],
       keySyscalls: [
-        { syscall: 'crypto', signature: 'sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")', purpose: 'Generates handshake accept header.' }
+        { syscall: 'crypto', signature: 'sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")', purpose: 'Generates handshake accept header.' },
+        { syscall: 'socket', signature: 'int socket(AF_INET, SOCK_STREAM, 0);', purpose: 'Underlying full-duplex TCP stream socket.' }
       ],
-      commonPitfalls: ['Masking server-to-client frames: RFC 6455 strictly forbids servers from masking frames sent to browsers.'],
+      commonPitfalls: [
+        'Masking server-to-client frames: RFC 6455 strictly forbids servers from masking frames sent to browsers. Browsers disconnect immediately.',
+        'Ignoring ping frames: Clients send ping frames (0x9); servers must immediately reply with pong (0xA) or connections will timeout.',
+        'Missing extended payload lengths: Assuming all frames are <= 125 bytes causes corruptions on larger image or state transfers.',
+        'Not cleaning up closed sockets: Dead client references in the broadcast set cause memory leaks and broken pipe crashes.'
+      ],
       visualizerType: 'canvas'
     },
     hints: {

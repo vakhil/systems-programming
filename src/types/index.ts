@@ -23,9 +23,33 @@ export interface TheoryDataStructure {
   asciiDiagram?: string;
 }
 
+export interface DeepTheoryConcept {
+  title: string;
+  tag: string;
+  coreConcept: string;
+  inDepthExplanation: string;
+  mathOrAlgorithm?: string;
+  asciiDiagram?: string;
+  codeSnippet?: string;
+}
+
+export interface ExecutionPhase {
+  phaseNumber: number;
+  phaseTitle: string;
+  summary: string;
+  architectureDeepDive: string;
+  visualWorkflowAscii: string;
+  concreteExecutionSteps: string[];
+  verificationCommand: string;
+  expectedOutput: string;
+  edgeCasesAndPitfalls: string[];
+}
+
 export interface ProjectTheory {
   highLevelArchitecture: string;
   mentalModel: string;
+  deepDiveConcepts?: DeepTheoryConcept[];
+  executionRoadmap?: ExecutionPhase[];
   dataStructures: TheoryDataStructure[];
   keySyscalls: Array<{ syscall: string; signature: string; purpose: string }>;
   commonPitfalls: string[];

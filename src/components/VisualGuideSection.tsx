@@ -18,9 +18,10 @@ import { GettingStartedGuide, Project } from '../types';
 interface VisualGuideSectionProps {
   guide: GettingStartedGuide;
   project: Project;
+  onNavigateToTheory?: () => void;
 }
 
-export const VisualGuideSection: React.FC<VisualGuideSectionProps> = ({ guide, project }) => {
+export const VisualGuideSection: React.FC<VisualGuideSectionProps> = ({ guide, project, onNavigateToTheory }) => {
   const [copiedCode, setCopiedCode] = useState(false);
   const [copiedCmd, setCopiedCmd] = useState<number | null>(null);
 
@@ -253,6 +254,32 @@ export const VisualGuideSection: React.FC<VisualGuideSectionProps> = ({ guide, p
           </pre>
         </div>
       </div>
+
+      {/* 5. Execution Blueprint & Theoretical Foundations Quick-Link */}
+      {onNavigateToTheory && (
+        <div className="p-6 rounded-3xl bg-gradient-to-r from-emerald-950/40 via-slate-900 to-cyan-950/40 border border-emerald-500/30 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 shadow-xl">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 uppercase tracking-wider">
+                Next Stage: Implementation
+              </span>
+              <h4 className="text-sm sm:text-base font-bold text-white">
+                Ready to execute this project step-by-step?
+              </h4>
+            </div>
+            <p className="text-xs text-slate-300 max-w-2xl">
+              Explore the in-depth architectural theory, visual state machines, and phase-by-phase execution blueprint with verification commands in the Visual Theory tab.
+            </p>
+          </div>
+          <button
+            onClick={onNavigateToTheory}
+            className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs shadow-lg shadow-emerald-500/20 transition-all flex-shrink-0"
+          >
+            <span>Open Execution Blueprint</span>
+            <ArrowRight className="w-4 h-4" />
+          </button>
+        </div>
+      )}
     </div>
   );
 };

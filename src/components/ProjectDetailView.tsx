@@ -19,7 +19,10 @@ import {
   ChevronRight,
   PlayCircle,
   Compass,
-  Film
+  Film,
+  Copy,
+  AlertTriangle,
+  ArrowRight
 } from 'lucide-react';
 import { InteractiveVideoPlayer } from './InteractiveVideoPlayer';
 import { VisualGuideSection } from './VisualGuideSection';
@@ -58,6 +61,15 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
   });
   const [notes, setNotes] = useState<string>(user.notes[project.id] || '');
   const [notesSaved, setNotesSaved] = useState<boolean>(false);
+  const [activePhaseIdx, setActivePhaseIdx] = useState<number>(0);
+  const [copiedPhaseCmd, setCopiedPhaseCmd] = useState<number | null>(null);
+  const [expandedTheoryIdx, setExpandedTheoryIdx] = useState<number | null>(0);
+
+  const handleCopyPhaseCmd = (cmd: string, idx: number) => {
+    navigator.clipboard.writeText(cmd);
+    setCopiedPhaseCmd(idx);
+    setTimeout(() => setCopiedPhaseCmd(null), 2000);
+  };
 
   const completedCount = project.milestones.filter(
     (m) => user.completedMilestones[`${project.id}_${m.id}`]
@@ -327,6 +339,7 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
             <VisualGuideSection
               guide={project.gettingStarted}
               project={project}
+              onNavigateToTheory={() => setActiveTab('theory')}
             />
           )}
         </div>
@@ -500,6 +513,326 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
               {project.theory.mentalModel}
             </div>
           </div>
+
+          {/* Deep-Dive Systems Engineering Foundations */}
+          {project.theory.deepDiveConcepts && project.theory.deepDiveConcepts.length > 0 && (
+            <div className="p-6 sm:p-8 rounded-3xl bg-slate-900/90 border border-cyan-500/30 shadow-2xl space-y-6">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-4">
+                <div>
+                  <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                    <Sparkles className="w-5 h-5 text-cyan-400" />
+                    <span>Deep-Dive Systems Engineering Foundations</span>
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Architectural mechanics, mathematical formulas, hardware cache boundaries, and low-level kernel contracts.
+                  </p>
+                </div>
+                <span className="text-xs font-mono text-cyan-400 bg-cyan-950/60 border border-cyan-500/30 px-3 py-1 rounded-xl font-bold">
+                  {project.theory.deepDiveConcepts.length} Deep Concepts
+                </span>
+              </div>
+
+              <div className="space-y-4">
+                {project.theory.deepDiveConcepts.map((concept, cIdx) => {
+                  const isExpanded = expandedTheoryIdx === cIdx;
+                  return (
+                    <div
+                      key={cIdx}
+                      className="rounded-2xl border border-slate-800 bg-slate-950/80 overflow-hidden transition-all shadow-md"
+                    >
+                      <button
+                        onClick={() => setExpandedTheoryIdx(isExpanded ? null : cIdx)}
+                        className="w-full text-left p-5 flex items-start justify-between gap-4 hover:bg-slate-900/40 transition-colors"
+                      >
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-2">
+                            <span className="px-2.5 py-0.5 rounded-md text-[10px] font-bold font-mono tracking-wider bg-cyan-500/10 text-cyan-400 border border-cyan-500/30">
+                              {concept.tag}
+                            </span>
+                            <span className="text-xs text-slate-500 font-mono">0{cIdx + 1}</span>
+                          </div>
+                          <h4 className="text-sm sm:text-base font-bold text-white">
+                            {concept.title}
+                          </h4>
+                        </div>
+                        <span className="text-xs text-cyan-400 font-semibold flex items-center gap-1 flex-shrink-0 mt-1">
+                          {isExpanded ? 'Collapse' : 'Deep Dive'}
+                          <ChevronRight
+                            className={`w-4 h-4 transition-transform duration-200 ${
+                              isExpanded ? 'rotate-90 text-cyan-400' : 'text-slate-500'
+                            }`}
+                          />
+                        </span>
+                      </button>
+
+                      {/* Concept Synopsis */}
+                      <div className="px-5 pb-3">
+                        <div className="p-3 rounded-xl bg-slate-900/60 border border-slate-800/80 text-xs text-slate-300 leading-relaxed font-sans">
+                          <span className="font-bold text-cyan-300">Core Principle: </span>
+                          {concept.coreConcept}
+                        </div>
+                      </div>
+
+                      {/* Expanded In-Depth Theory */}
+                      {isExpanded && (
+                        <div className="px-5 pb-5 pt-2 space-y-4 border-t border-slate-900 text-xs animate-fadeIn">
+                          <div className="text-slate-300 leading-relaxed space-y-2 whitespace-pre-line font-sans">
+                            {concept.inDepthExplanation}
+                          </div>
+
+                          {concept.mathOrAlgorithm && (
+                            <div className="p-4 rounded-xl bg-slate-900/90 border border-cyan-500/20 font-mono text-cyan-300 space-y-1">
+                              <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">
+                                Algorithmic Formula &amp; Mathematical Mechanics:
+                              </div>
+                              <pre className="text-xs whitespace-pre-wrap leading-relaxed overflow-x-auto text-emerald-400">
+                                {concept.mathOrAlgorithm}
+                              </pre>
+                            </div>
+                          )}
+
+                          {concept.asciiDiagram && (
+                            <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 space-y-1 font-mono">
+                              <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">
+                                Visual Architecture / State Machine Diagram:
+                              </div>
+                              <pre className="p-3 bg-slate-950 rounded-lg border border-slate-800 text-cyan-300 text-xs overflow-x-auto leading-tight">
+                                {concept.asciiDiagram}
+                              </pre>
+                            </div>
+                          )}
+
+                          {concept.codeSnippet && (
+                            <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 space-y-1 font-mono">
+                              <div className="text-[10px] uppercase tracking-wider text-amber-400 font-bold">
+                                Systems Implementation Reference:
+                              </div>
+                              <pre className="p-3 bg-slate-950 rounded-lg border border-slate-800 text-amber-300 text-xs overflow-x-auto leading-relaxed">
+                                {concept.codeSnippet}
+                              </pre>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* How to Execute This Project: Step-by-Step Practical Blueprint */}
+          {project.theory.executionRoadmap && project.theory.executionRoadmap.length > 0 && (
+            <div className="p-6 sm:p-8 rounded-3xl bg-gradient-to-br from-slate-900 via-slate-900 to-slate-950 border border-emerald-500/40 shadow-2xl space-y-6">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-4">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 font-bold">
+                      <Terminal className="w-4 h-4" />
+                    </div>
+                    <h3 className="text-lg sm:text-xl font-bold text-white">
+                      How to Execute This Project: Practical Engineering Blueprint
+                    </h3>
+                  </div>
+                  <p className="text-xs text-slate-400">
+                    Step-by-step execution lifecycle from zero-syscall baseline to production-ready stress tests.
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-mono font-medium text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 px-3 py-1 rounded-xl">
+                    {project.theory.executionRoadmap.length} Sequential Execution Phases
+                  </span>
+                </div>
+              </div>
+
+              {/* Phase Navigation Tabs */}
+              <div className="flex flex-wrap items-center gap-2 border-b border-slate-800/80 pb-3">
+                {project.theory.executionRoadmap.map((phase, pIdx) => (
+                  <button
+                    key={pIdx}
+                    onClick={() => setActivePhaseIdx(pIdx)}
+                    className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold transition-all ${
+                      activePhaseIdx === pIdx
+                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/50 shadow-md shadow-emerald-500/10'
+                        : 'text-slate-400 hover:text-white bg-slate-950 hover:bg-slate-900 border border-slate-800'
+                    }`}
+                  >
+                    <span className="w-5 h-5 rounded-md bg-slate-900 border border-slate-700 flex items-center justify-center text-[10px] font-mono font-bold text-emerald-400">
+                      {phase.phaseNumber}
+                    </span>
+                    <span className="truncate max-w-[150px] sm:max-w-none">
+                      {phase.phaseTitle}
+                    </span>
+                  </button>
+                ))}
+              </div>
+
+              {/* Active Execution Phase Details */}
+              {(() => {
+                const curPhase = project.theory.executionRoadmap[activePhaseIdx] || project.theory.executionRoadmap[0];
+                return (
+                  <div className="space-y-6 animate-fadeIn">
+                    {/* Phase Header */}
+                    <div className="p-5 rounded-2xl bg-slate-950 border border-slate-800 space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="px-3 py-0.5 rounded-full text-xs font-bold font-mono bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                          PHASE {curPhase.phaseNumber} OF {project.theory.executionRoadmap.length}
+                        </span>
+                        <span className="text-xs text-slate-500 font-mono">
+                          Target: {curPhase.phaseTitle}
+                        </span>
+                      </div>
+                      <h4 className="text-base sm:text-lg font-bold text-white">
+                        {curPhase.phaseTitle}
+                      </h4>
+                      <p className="text-xs sm:text-sm text-slate-300 leading-relaxed font-sans">
+                        {curPhase.summary}
+                      </p>
+                    </div>
+
+                    {/* Architectural Deep-Dive for this phase */}
+                    <div className="p-5 rounded-2xl bg-slate-950/70 border border-cyan-500/20 space-y-2">
+                      <div className="text-xs uppercase font-bold text-cyan-400 flex items-center gap-1.5 tracking-wider">
+                        <BookOpen className="w-3.5 h-3.5" />
+                        <span>Architectural Theory Behind This Phase:</span>
+                      </div>
+                      <p className="text-xs sm:text-sm text-slate-300 leading-relaxed whitespace-pre-line font-sans">
+                        {curPhase.architectureDeepDive}
+                      </p>
+                    </div>
+
+                    {/* Visual Workflow ASCII Diagram */}
+                    {curPhase.visualWorkflowAscii && (
+                      <div className="p-5 rounded-2xl bg-slate-950 border border-slate-800 space-y-2 font-mono">
+                        <div className="text-xs uppercase font-bold text-emerald-400 flex items-center gap-1.5 tracking-wider">
+                          <Layers className="w-3.5 h-3.5" />
+                          <span>Phase Visual Execution Workflow &amp; State Map:</span>
+                        </div>
+                        <pre className="p-4 bg-slate-900 rounded-xl border border-slate-800/80 text-emerald-300 text-xs overflow-x-auto leading-relaxed shadow-inner">
+                          {curPhase.visualWorkflowAscii}
+                        </pre>
+                      </div>
+                    )}
+
+                    {/* Step-by-Step Actionable Execution Steps */}
+                    <div className="space-y-3">
+                      <div className="text-xs uppercase font-bold text-slate-300 tracking-wider flex items-center gap-1.5">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                        <span>Actionable Execution Steps:</span>
+                      </div>
+                      <div className="grid grid-cols-1 gap-2.5">
+                        {curPhase.concreteExecutionSteps.map((step, sIdx) => (
+                          <div
+                            key={sIdx}
+                            className="p-3.5 rounded-xl bg-slate-950 border border-slate-800/80 hover:border-slate-700/80 transition-all flex items-start gap-3 text-xs"
+                          >
+                            <div className="w-6 h-6 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 font-bold font-mono text-[11px] flex-shrink-0 mt-0.5">
+                              {sIdx + 1}
+                            </div>
+                            <div className="text-slate-300 leading-relaxed pt-0.5">
+                              {step}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Verification Command & Expected Terminal Output */}
+                    <div className="p-5 rounded-2xl bg-slate-950 border border-slate-800 space-y-3 font-mono">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="text-xs uppercase font-bold text-amber-400 flex items-center gap-1.5 tracking-wider">
+                          <Terminal className="w-3.5 h-3.5" />
+                          <span>Verification Command:</span>
+                        </div>
+                        <button
+                          onClick={() => handleCopyPhaseCmd(curPhase.verificationCommand, activePhaseIdx)}
+                          className="flex items-center gap-1.5 px-3 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition-all"
+                        >
+                          {copiedPhaseCmd === activePhaseIdx ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-400" />
+                              <span className="text-emerald-400">Copied!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3.5 h-3.5" />
+                              <span>Copy Command</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+
+                      <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 flex items-center gap-2 text-xs text-amber-300 overflow-x-auto">
+                        <span className="text-emerald-400 font-bold">$</span>
+                        <span>{curPhase.verificationCommand}</span>
+                      </div>
+
+                      {/* Expected Terminal Output */}
+                      <div className="mt-3 space-y-1.5">
+                        <div className="text-[10px] text-slate-500 uppercase tracking-wider font-bold">
+                          Expected Verified Terminal Output:
+                        </div>
+                        <pre className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 text-emerald-400 text-xs overflow-x-auto whitespace-pre-wrap leading-relaxed shadow-inner">
+                          {curPhase.expectedOutput}
+                        </pre>
+                      </div>
+                    </div>
+
+                    {/* Edge Cases & Pitfalls for this Phase */}
+                    {curPhase.edgeCasesAndPitfalls && curPhase.edgeCasesAndPitfalls.length > 0 && (
+                      <div className="p-4 rounded-2xl bg-rose-950/20 border border-rose-900/30 space-y-2">
+                        <div className="text-xs uppercase font-bold text-rose-400 flex items-center gap-1.5 tracking-wider">
+                          <AlertTriangle className="w-3.5 h-3.5" />
+                          <span>Phase Gotchas &amp; Traps to Avoid:</span>
+                        </div>
+                        <ul className="space-y-1.5 text-xs text-slate-300">
+                          {curPhase.edgeCasesAndPitfalls.map((gotcha, gIdx) => (
+                            <li key={gIdx} className="flex items-start gap-2">
+                              <span className="text-rose-400 font-bold">&bull;</span>
+                              <span>{gotcha}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    {/* Phase Navigation Buttons */}
+                    <div className="flex items-center justify-between pt-3 border-t border-slate-800/80">
+                      <button
+                        onClick={() => setActivePhaseIdx((prev) => Math.max(0, prev - 1))}
+                        disabled={activePhaseIdx === 0}
+                        className={`px-4 py-2 rounded-xl text-xs font-semibold transition-all ${
+                          activePhaseIdx === 0
+                            ? 'opacity-40 cursor-not-allowed text-slate-600 bg-slate-950'
+                            : 'text-slate-300 hover:text-white bg-slate-900 hover:bg-slate-800 border border-slate-800'
+                        }`}
+                      >
+                        &larr; Previous Phase
+                      </button>
+
+                      <span className="text-xs text-slate-500 font-mono">
+                        Phase {activePhaseIdx + 1} of {project.theory.executionRoadmap.length}
+                      </span>
+
+                      <button
+                        onClick={() => setActivePhaseIdx((prev) => Math.min(project.theory.executionRoadmap!.length - 1, prev + 1))}
+                        disabled={activePhaseIdx === project.theory.executionRoadmap.length - 1}
+                        className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold transition-all ${
+                          activePhaseIdx === project.theory.executionRoadmap.length - 1
+                            ? 'opacity-40 cursor-not-allowed text-slate-600 bg-slate-950'
+                            : 'bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-bold shadow-md shadow-emerald-500/20'
+                        }`}
+                      >
+                        <span>Next Phase</span>
+                        <ArrowRight className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
 
           {/* ASCII Memory / Protocol Diagrams */}
           <div className="p-6 rounded-3xl bg-slate-900/80 border border-slate-800 space-y-4">
