@@ -22,7 +22,8 @@ import {
   Film,
   Copy,
   AlertTriangle,
-  ArrowRight
+  ArrowRight,
+  Info
 } from 'lucide-react';
 import { InteractiveVideoPlayer } from './InteractiveVideoPlayer';
 import { VisualGuideSection } from './VisualGuideSection';
@@ -63,12 +64,19 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
   const [notesSaved, setNotesSaved] = useState<boolean>(false);
   const [activePhaseIdx, setActivePhaseIdx] = useState<number>(0);
   const [copiedPhaseCmd, setCopiedPhaseCmd] = useState<number | null>(null);
+  const [copiedPhaseCode, setCopiedPhaseCode] = useState<number | null>(null);
   const [expandedTheoryIdx, setExpandedTheoryIdx] = useState<number | null>(0);
 
   const handleCopyPhaseCmd = (cmd: string, idx: number) => {
     navigator.clipboard.writeText(cmd);
     setCopiedPhaseCmd(idx);
     setTimeout(() => setCopiedPhaseCmd(null), 2000);
+  };
+
+  const handleCopyPhaseCode = (code: string, idx: number) => {
+    navigator.clipboard.writeText(code);
+    setCopiedPhaseCode(idx);
+    setTimeout(() => setCopiedPhaseCode(null), 2000);
   };
 
   const completedCount = project.milestones.filter(
@@ -691,11 +699,24 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
                       </p>
                     </div>
 
+                    {/* Plain-English "Dumb It Down" ELI5 Breakdown */}
+                    {curPhase.eli5Explanation && (
+                      <div className="p-5 rounded-2xl bg-amber-950/20 border border-amber-500/30 space-y-2">
+                        <div className="text-xs uppercase font-bold text-amber-400 flex items-center gap-1.5 tracking-wider">
+                          <Lightbulb className="w-4 h-4 text-amber-400" />
+                          <span>Dumb It Down: Plain English Breakdown (ELI5)</span>
+                        </div>
+                        <p className="text-xs sm:text-sm text-amber-200/90 leading-relaxed font-sans whitespace-pre-line">
+                          {curPhase.eli5Explanation}
+                        </p>
+                      </div>
+                    )}
+
                     {/* Architectural Deep-Dive for this phase */}
                     <div className="p-5 rounded-2xl bg-slate-950/70 border border-cyan-500/20 space-y-2">
                       <div className="text-xs uppercase font-bold text-cyan-400 flex items-center gap-1.5 tracking-wider">
                         <BookOpen className="w-3.5 h-3.5" />
-                        <span>Architectural Theory Behind This Phase:</span>
+                        <span>Execution Theory Behind This Phase:</span>
                       </div>
                       <p className="text-xs sm:text-sm text-slate-300 leading-relaxed whitespace-pre-line font-sans">
                         {curPhase.architectureDeepDive}
@@ -719,7 +740,7 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
                     <div className="space-y-3">
                       <div className="text-xs uppercase font-bold text-slate-300 tracking-wider flex items-center gap-1.5">
                         <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                        <span>Actionable Execution Steps:</span>
+                        <span>Step-by-Step Construction Guide:</span>
                       </div>
                       <div className="grid grid-cols-1 gap-2.5">
                         {curPhase.concreteExecutionSteps.map((step, sIdx) => (
@@ -737,6 +758,62 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
                         ))}
                       </div>
                     </div>
+
+                    {/* Hands-On Copyable Code Snippet */}
+                    {curPhase.handsOnCodeSnippet && (
+                      <div className="p-5 rounded-2xl bg-slate-950 border border-slate-800 space-y-3 font-mono">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div className="text-xs uppercase font-bold text-emerald-400 flex items-center gap-1.5 tracking-wider">
+                            <Code2 className="w-4 h-4 text-emerald-400" />
+                            <span>Hands-On Phase Implementation Code (Copy &amp; Pasteable):</span>
+                          </div>
+                          <button
+                            onClick={() => handleCopyPhaseCode(curPhase.handsOnCodeSnippet!, activePhaseIdx)}
+                            className="flex items-center gap-1.5 px-3 py-1 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-slate-950 text-xs font-bold transition-all shadow-md"
+                          >
+                            {copiedPhaseCode === activePhaseIdx ? (
+                              <>
+                                <Check className="w-3.5 h-3.5" />
+                                <span>Copied Code!</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                <span>Copy Phase Code</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                        <pre className="p-4 bg-slate-900 rounded-xl border border-slate-800/80 text-emerald-300 text-xs overflow-x-auto leading-relaxed max-h-96 shadow-inner">
+                          {curPhase.handsOnCodeSnippet}
+                        </pre>
+                      </div>
+                    )}
+
+                    {/* Line-by-Line Code Breakdown */}
+                    {curPhase.codeExplanationLines && curPhase.codeExplanationLines.length > 0 && (
+                      <div className="space-y-3">
+                        <div className="text-xs uppercase font-bold text-cyan-400 tracking-wider flex items-center gap-1.5">
+                          <Info className="w-4 h-4 text-cyan-400" />
+                          <span>Line-by-Line Code Breakdown: What Every Line Actually Does</span>
+                        </div>
+                        <div className="grid grid-cols-1 gap-2">
+                          {curPhase.codeExplanationLines.map((lineItem, lIdx) => (
+                            <div
+                              key={lIdx}
+                              className="p-3 rounded-xl bg-slate-950 border border-slate-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 text-xs"
+                            >
+                              <span className="font-mono text-emerald-400 font-bold sm:w-56 flex-shrink-0 bg-slate-900 px-2 py-1 rounded-md border border-slate-800 truncate">
+                                {lineItem.line}
+                              </span>
+                              <span className="text-slate-300 leading-relaxed flex-1">
+                                {lineItem.plainMeaning}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
 
                     {/* Verification Command & Expected Terminal Output */}
                     <div className="p-5 rounded-2xl bg-slate-950 border border-slate-800 space-y-3 font-mono">
@@ -768,6 +845,13 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
                         <span>{curPhase.verificationCommand}</span>
                       </div>
 
+                      {curPhase.verificationBreakdown && (
+                        <p className="text-xs text-slate-400 font-sans italic leading-relaxed pt-1">
+                          <span className="font-bold text-amber-400 not-italic">Command Breakdown: </span>
+                          {curPhase.verificationBreakdown}
+                        </p>
+                      )}
+
                       {/* Expected Terminal Output */}
                       <div className="mt-3 space-y-1.5">
                         <div className="text-[10px] text-slate-500 uppercase tracking-wider font-bold">
@@ -776,6 +860,12 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
                         <pre className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 text-emerald-400 text-xs overflow-x-auto whitespace-pre-wrap leading-relaxed shadow-inner">
                           {curPhase.expectedOutput}
                         </pre>
+                        {curPhase.outputExplanation && (
+                          <p className="text-xs text-slate-400 font-sans italic leading-relaxed pt-1">
+                            <span className="font-bold text-emerald-400 not-italic">What This Proves: </span>
+                            {curPhase.outputExplanation}
+                          </p>
+                        )}
                       </div>
                     </div>
 

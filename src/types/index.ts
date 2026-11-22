@@ -37,11 +37,16 @@ export interface ExecutionPhase {
   phaseNumber: number;
   phaseTitle: string;
   summary: string;
+  eli5Explanation?: string; // Dumbed-down plain English explanation
   architectureDeepDive: string;
   visualWorkflowAscii: string;
   concreteExecutionSteps: string[];
+  handsOnCodeSnippet?: string; // Complete copy-pasteable working code for this phase
+  codeExplanationLines?: Array<{ line: string; plainMeaning: string }>; // Line-by-line breakdown in plain English
   verificationCommand: string;
+  verificationBreakdown?: string; // What the verification command does
   expectedOutput: string;
+  outputExplanation?: string; // What the terminal output proves
   edgeCasesAndPitfalls: string[];
 }
 
